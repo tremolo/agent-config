@@ -1,0 +1,39 @@
+{
+  "name": "tremolo",
+  "version": "1.5.0",
+  "description": "Lutz pi coding agent commands, skills, extensions, and themes",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tremolo/agent-config.git"
+  },
+  "readme": "README.md",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi-skill",
+    "pi-theme"
+  ],
+  "pi": {
+    "extensions": [
+      "./pi-extensions"
+    ],
+    "skills": [
+      "./skills"
+    ],
+    "themes": [
+      "./pi-themes"
+    ],
+    "prompts": [
+      "./commands"
+    ]
+  },
+  "dependencies": {
+    "diff": "^8.0.2"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-tui": "*"
+  }
+}
