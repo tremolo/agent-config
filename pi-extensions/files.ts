@@ -90,7 +90,8 @@ type PlatformConfig = {
 
 const FILE_TAG_REGEX = /<file\s+name=["']([^"']+)["']>/g;
 const FILE_URL_REGEX = /file:\/\/[^\s"'<>]+/g;
-const PATH_REGEX = /(?:^|[\s"'`([{<])((?:~|\/)[^\s"'`<>)\]]+)/g;
+// Match quoted paths (with spaces) or unquoted paths (no spaces)
+const PATH_REGEX = /(?:^|[\s([{<])(?:("|')(.*?)\1|((?:~|\/)[^\s"'`<>)\]]+))|(?:^|[\s"'`([{<])((?:~|\/)[^\s"'`<>)\]]+)/g;
 
 const MAX_EDIT_BYTES = 40 * 1024 * 1024;
 
@@ -241,6 +242,8 @@ const extractFileReferencesFromEntry = (entry: SessionEntry): string[] => {
 
 const sanitizeReference = (raw: string): string => {
 	let value = raw.trim();
+	// Remove surrounding quotes first (preserving internal spaces)
+	value = value.replace(/^(["'])(.*)\1$/, "$2");
 	value = value.replace(/^["'`(<\[]+/, "");
 	value = value.replace(/[>"'`,;).\]]+$/, "");
 	value = value.replace(/[.,;:]+$/, "");
@@ -351,7 +354,7 @@ const collectRecentFileReferences = (entries: SessionEntry[], cwd: string, limit
 
 const findLatestFileReference = (entries: SessionEntry[], cwd: string): FileReference | null => {
 	const refs = collectRecentFileReferences(entries, cwd, 100);
-	return refs.find((ref) => ref.exists) ?? null;
+	return refs.find((ref) => ref.exists && !ref.isDirectory) ?? null;
 };
 
 const toCanonicalPath = (inputPath: string): { canonicalPath: string; isDirectory: boolean } | null => {
