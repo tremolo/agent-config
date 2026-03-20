@@ -80,6 +80,11 @@ async function selectExtractionModel(
 		getApiKey: (model: Model<Api>) => Promise<string | undefined>;
 	},
 ): Promise<Model<Api>> {
+	// Using the currently selected model for question extraction
+	return currentModel;
+
+	/*
+	// Original selection logic - commented out
 	const codexModel = modelRegistry.find("openai-codex", CODEX_MODEL_ID);
 	if (codexModel) {
 		const apiKey = await modelRegistry.getApiKey(codexModel);
@@ -99,6 +104,7 @@ async function selectExtractionModel(
 	}
 
 	return haikuModel;
+	*/
 }
 
 /**
@@ -409,18 +415,18 @@ class QnAComponent implements Component {
 
 export default function (pi: ExtensionAPI) {
 	const answerHandler = async (ctx: ExtensionContext) => {
-			if (!ctx.hasUI) {
-				ctx.ui.notify("answer requires interactive mode", "error");
-				return;
-			}
+		if (!ctx.hasUI) {
+			ctx.ui.notify("answer requires interactive mode", "error");
+			return;
+		}
 
-			if (!ctx.model) {
-				ctx.ui.notify("No model selected", "error");
-				return;
-			}
+		if (!ctx.model) {
+			ctx.ui.notify("No model selected", "error");
+			return;
+		}
 
-			// Find the last assistant message on the current branch
-			const branch = ctx.sessionManager.getBranch();
+		// Find the last assistant message on the current branch
+		const branch = ctx.sessionManager.getBranch();
 			let lastAssistantText: string | undefined;
 
 			for (let i = branch.length - 1; i >= 0; i--) {
@@ -448,7 +454,6 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 
-			// Select the best model for extraction (prefer Codex mini, then haiku)
 			const extractionModel = await selectExtractionModel(ctx.model, ctx.modelRegistry);
 
 			// Run extraction with loader UI
