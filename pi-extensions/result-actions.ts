@@ -285,6 +285,47 @@ const quickLookAllFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths:
 	}
 };
 
+// Reveal files in Nautilus using D-Bus
+const revealFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths: string[]): Promise<void> => {
+	if (paths.length === 0) {
+		ctx.ui.notify("No files to reveal", "warning");
+		return;
+	}
+
+	// Filter to existing files/directories
+	const existingPaths = paths.filter((p) => existsSync(p));
+
+	if (existingPaths.length === 0) {
+		ctx.ui.notify("No valid files found to reveal", "warning");
+		return;
+	}
+
+	// Build file:// URIs
+	const uris = existingPaths.map((p) => `file://${p}`);
+	const uriArray = `['${uris.join("','")}']`;
+
+	try {
+		const result = await pi.exec("gdbus", [
+			"call",
+			"--session",
+			"--dest", "org.gnome.Nautilus",
+			"--object-path", "/org/freedesktop/FileManager1",
+			"--method", "org.freedesktop.FileManager1.ShowItems",
+			uriArray,
+			"",
+		]);
+
+		if (result.code !== 0) {
+			ctx.ui.notify(`Failed to reveal files: ${result.stderr || "unknown error"}`, "error");
+			return;
+		}
+
+		ctx.ui.notify(`Revealed ${existingPaths.length} file${existingPaths.length > 1 ? "s" : ""} in Nautilus`, "success");
+	} catch (err) {
+		ctx.ui.notify(`Failed to reveal files: ${err}`, "error");
+	}
+};
+
 // Open a single file with the default application
 const openFile = async (pi: ExtensionAPI, ctx: ExtensionContext, filePath: string): Promise<void> => {
 	if (!existsSync(filePath)) {
@@ -333,13 +374,14 @@ const showActionSelector = async (
 	ctx: ExtensionContext,
 	resultText: string,
 	paths: string[],
-): Promise<"copy" | "quicklook" | "open" | null> => {
+): Promise<"copy" | "reveal" | "open" | "quicklook" | null> => {
 	const fileCount = paths.length;
 
 	const actions: SelectItem[] = [
-		{ value: "copy", label: "📋 Copy result to clipboard" },
+		{ value: "copy", label: "📋 Copy to clipboard" },
 		...(fileCount > 0
 			? [
+					{ value: "reveal", label: `🔍 Reveal ${fileCount} file${fileCount > 1 ? "s" : ""} in Nautilus` },
 					{ value: "open", label: `📂 Open ${fileCount} file${fileCount > 1 ? "s" : ""}` },
 					{ value: "quicklook", label: `👁 Quick Look ${fileCount} file${fileCount > 1 ? "s" : ""}` },
 				]
@@ -351,7 +393,7 @@ const showActionSelector = async (
 		return null;
 	}
 
-	return ctx.ui.custom<"copy" | "quicklook" | "open" | null>((tui, theme, _kb, done) => {
+	return ctx.ui.custom<"copy" | "reveal" | "open" | "quicklook" | null>((tui, theme, _kb, done) => {
 		const container = new Container();
 		container.addChild(new DynamicBorder((str) => theme.fg("accent", str)));
 		container.addChild(new Text(theme.fg("accent", theme.bold("What would you like to do with this result?"))));
@@ -419,11 +461,14 @@ const handleResultAction = async (pi: ExtensionAPI, ctx: ExtensionContext): Prom
 		case "copy":
 			await copyToClipboard(pi, ctx, lastFileListResult);
 			break;
-		case "quicklook":
-			await quickLookAllFiles(pi, ctx, lastExtractedPaths);
+		case "reveal":
+			await revealFiles(pi, ctx, lastExtractedPaths);
 			break;
 		case "open":
 			await openAllFiles(pi, ctx, lastExtractedPaths);
+			break;
+		case "quicklook":
+			await quickLookAllFiles(pi, ctx, lastExtractedPaths);
 			break;
 	}
 };
