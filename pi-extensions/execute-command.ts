@@ -49,7 +49,7 @@ The command/message appears in the conversation as a user message.`,
   });
 
   // Execute pending command after agent turn completes
-  pi.on("agent_end", async (event, ctx) => {
+  pi.on("agent_end", async (_event, ctx) => {
     if (pendingCommand) {
       const { command } = pendingCommand;
       pendingCommand = null;
@@ -57,13 +57,12 @@ The command/message appears in the conversation as a user message.`,
       const normalizedCommand = command.trim();
       const commandName = normalizedCommand.split(/\s+/)[0];
       
-      // Special handling for /answer via event bus (needs context)
-      // Note: /answer works on the last assistant message, so any inline args are ignored.
+      // Special handling for commands that need in-process triggering
       if (commandName === "/answer") {
         setTimeout(() => {
           pi.events.emit("trigger:answer", ctx);
         }, 100);
-      } 
+      }
       // Auto-execute slash commands via sendUserMessage
       else if (normalizedCommand.startsWith("/")) {
         setTimeout(() => {
@@ -73,8 +72,8 @@ The command/message appears in the conversation as a user message.`,
       // For non-command text, prefill editor and notify
       else {
         if (ctx.hasUI) {
-          ctx.ui.setEditorText(command);
-          ctx.ui.notify(`Press Enter to send: ${command}`, "info");
+          ctx.ui.setEditorText(normalizedCommand);
+          ctx.ui.notify(`Press Enter to send: ${normalizedCommand}`, "info");
         }
       }
     }
