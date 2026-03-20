@@ -53,17 +53,21 @@ The command/message appears in the conversation as a user message.`,
     if (pendingCommand) {
       const { command } = pendingCommand;
       pendingCommand = null;
+
+      const normalizedCommand = command.trim();
+      const commandName = normalizedCommand.split(/\s+/)[0];
       
       // Special handling for /answer via event bus (needs context)
-      if (command === "/answer") {
+      // Note: /answer works on the last assistant message, so any inline args are ignored.
+      if (commandName === "/answer") {
         setTimeout(() => {
           pi.events.emit("trigger:answer", ctx);
         }, 100);
       } 
       // Auto-execute slash commands via sendUserMessage
-      else if (command.startsWith("/")) {
+      else if (normalizedCommand.startsWith("/")) {
         setTimeout(() => {
-          pi.sendUserMessage(command);
+          pi.sendUserMessage(normalizedCommand);
         }, 100);
       }
       // For non-command text, prefill editor and notify
