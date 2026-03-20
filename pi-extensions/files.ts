@@ -4,6 +4,11 @@
  * /files command lists files in the current git tree (plus session-referenced files)
  * and offers quick actions like reveal, open, edit, or diff.
  * /diff is kept as an alias to the same picker.
+ *
+ * Platform support:
+ * - macOS: Uses Finder, qlmanage (Quick Look), open
+ * - Linux/GNOME: Uses Nautilus (reveal), xdg-open (open), sushi (Quick Look) or fallback to file manager
+ * - Other Linux DEs: Uses xdg-open with appropriate fallbacks
  */
 
 import { spawnSync } from "node:child_process";
@@ -74,11 +79,75 @@ type SessionFileChange = {
 	lastTimestamp: number;
 };
 
+type PlatformConfig = {
+	openCommand: string;
+	revealCommand: string;
+	revealArgs: (targetPath: string, isDirectory: boolean) => string[];
+	quickLookCommand: string | null;
+	quickLookArgs: (targetPath: string) => string[];
+	fileManager: string;
+};
+
 const FILE_TAG_REGEX = /<file\s+name=["']([^"']+)["']>/g;
 const FILE_URL_REGEX = /file:\/\/[^\s"'<>]+/g;
-const PATH_REGEX = /(?:^|[\s"'`([{<])((?:~|\/)[^\s"'`<>)}\]]+)/g;
+const PATH_REGEX = /(?:^|[\s"'`([{<])((?:~|\/)[^\s"'`<>)\]]+)/g;
 
 const MAX_EDIT_BYTES = 40 * 1024 * 1024;
+
+// Detect desktop environment and configure platform-specific commands
+const getPlatformConfig = (): PlatformConfig => {
+	// macOS
+	if (process.platform === "darwin") {
+		return {
+			openCommand: "open",
+			revealCommand: "open",
+			revealArgs: (targetPath, isDirectory) => isDirectory ? [targetPath] : ["-R", targetPath],
+			quickLookCommand: "qlmanage",
+			quickLookArgs: (targetPath) => ["-p", targetPath],
+			fileManager: "Finder",
+		};
+	}
+
+	// Linux - detect DE
+	const desktopSession = process.env.DESKTOP_SESSION?.toLowerCase() || "";
+	const xdgCurrentDesktop = process.env.XDG_CURRENT_DESKTOP?.toLowerCase() || "";
+	const isGnome = desktopSession.includes("gnome") || xdgCurrentDesktop.includes("gnome");
+	const isKde = desktopSession.includes("kde") || xdgCurrentDesktop.includes("kde");
+	const isXfce = desktopSession.includes("xfce") || xdgCurrentDesktop.includes("xfce");
+
+	// Determine file manager
+	let fileManager = "file manager";
+	if (isGnome) fileManager = "Nautilus/Files";
+	if (isKde) fileManager = "Dolphin";
+	if (isXfce) fileManager = "Thunar";
+
+	// Check for sushi (GNOME's quick look previewer)
+	const hasSushi = (() => {
+		try {
+			const result = spawnSync("which", ["sushi"], { encoding: "utf8" });
+			return result.status === 0;
+		} catch {
+			return false;
+		}
+	})();
+
+	return {
+		openCommand: "xdg-open",
+		revealCommand: isKde ? "dolphin" : isXfce ? "thunar" : "nautilus",
+		revealArgs: (targetPath, isDirectory) => {
+			if (isKde) {
+				return isDirectory ? ["--select", targetPath] : ["--select", targetPath];
+			}
+			// GNOME/Nautilus: parent directory for files, direct for directories
+			return isDirectory ? [targetPath] : ["--select", targetPath];
+		},
+		quickLookCommand: hasSushi ? "sushi" : null,
+		quickLookArgs: (targetPath) => [targetPath],
+		fileManager,
+	};
+};
+
+const PLATFORM = getPlatformConfig();
 
 const extractFileReferencesFromText = (text: string): string[] => {
 	const refs: string[] = [];
@@ -634,12 +703,21 @@ const showActionSelector = async (
 	ctx: ExtensionContext,
 	options: { canQuickLook: boolean; canEdit: boolean; canDiff: boolean },
 ): Promise<"reveal" | "quicklook" | "open" | "edit" | "addToPrompt" | "diff" | null> => {
+	// Platform-specific labels
+	const isMac = process.platform === "darwin";
+	const revealLabel = isMac ? "Reveal in Finder" : `Reveal in ${PLATFORM.fileManager}`;
+	const quickLookLabel = isMac
+		? "Open in Quick Look"
+		: PLATFORM.quickLookCommand
+			? "Quick preview (sushi)"
+			: "Quick preview (file manager)";
+
 	const actions: SelectItem[] = [
-		...(options.canDiff ? [{ value: "diff", label: "Diff in VS Code" }] : []),
-		{ value: "reveal", label: "Reveal in Finder" },
+		...(options.canDiff ? [{ value: "diff", label: "Diff in VS Code:" }] : []),
+		{ value: "reveal", label: revealLabel },
 		{ value: "open", label: "Open" },
 		{ value: "addToPrompt", label: "Add to prompt" },
-		...(options.canQuickLook ? [{ value: "quicklook", label: "Open in Quick Look" }] : []),
+		...(options.canQuickLook ? [{ value: "quicklook", label: quickLookLabel }] : []),
 		...(options.canEdit ? [{ value: "edit", label: "Edit" }] : []),
 	];
 
@@ -684,8 +762,7 @@ const openPath = async (pi: ExtensionAPI, ctx: ExtensionContext, target: FileEnt
 		return;
 	}
 
-	const command = process.platform === "darwin" ? "open" : "xdg-open";
-	const result = await pi.exec(command, [target.resolvedPath]);
+	const result = await pi.exec(PLATFORM.openCommand, [target.resolvedPath]);
 	if (result.code !== 0) {
 		const errorMessage = result.stderr?.trim() || `Failed to open ${target.displayPath}`;
 		ctx.ui.notify(errorMessage, "error");
@@ -754,29 +831,25 @@ const revealPath = async (pi: ExtensionAPI, ctx: ExtensionContext, target: FileE
 	}
 
 	const isDirectory = target.isDirectory || statSync(target.resolvedPath).isDirectory();
-	let command = "open";
-	let args: string[] = [];
+	const args = PLATFORM.revealArgs(target.resolvedPath, isDirectory);
 
-	if (process.platform === "darwin") {
-		args = isDirectory ? [target.resolvedPath] : ["-R", target.resolvedPath];
-	} else {
-		command = "xdg-open";
-		args = [isDirectory ? target.resolvedPath : path.dirname(target.resolvedPath)];
-	}
-
-	const result = await pi.exec(command, args);
+	const result = await pi.exec(PLATFORM.revealCommand, args);
 	if (result.code !== 0) {
+		// Fallback to xdg-open if file manager command fails
+		if (process.platform !== "darwin") {
+			const parentDir = isDirectory ? target.resolvedPath : path.dirname(target.resolvedPath);
+			const fallbackResult = await pi.exec("xdg-open", [parentDir]);
+			if (fallbackResult.code !== 0) {
+				ctx.ui.notify(`Failed to reveal ${target.displayPath}`, "error");
+			}
+			return;
+		}
 		const errorMessage = result.stderr?.trim() || `Failed to reveal ${target.displayPath}`;
 		ctx.ui.notify(errorMessage, "error");
 	}
 };
 
 const quickLookPath = async (pi: ExtensionAPI, ctx: ExtensionContext, target: FileEntry): Promise<void> => {
-	if (process.platform !== "darwin") {
-		ctx.ui.notify("Quick Look is only available on macOS", "warning");
-		return;
-	}
-
 	if (!existsSync(target.resolvedPath)) {
 		ctx.ui.notify(`File not found: ${target.displayPath}`, "error");
 		return;
@@ -788,11 +861,26 @@ const quickLookPath = async (pi: ExtensionAPI, ctx: ExtensionContext, target: Fi
 		return;
 	}
 
-	const result = await pi.exec("qlmanage", ["-p", target.resolvedPath]);
-	if (result.code !== 0) {
-		const errorMessage = result.stderr?.trim() || `Failed to Quick Look ${target.displayPath}`;
-		ctx.ui.notify(errorMessage, "error");
+	// macOS: use qlmanage
+	if (process.platform === "darwin") {
+		const result = await pi.exec("qlmanage", ["-p", target.resolvedPath]);
+		if (result.code !== 0) {
+			const errorMessage = result.stderr?.trim() || `Failed to Quick Look ${target.displayPath}`;
+			ctx.ui.notify(errorMessage, "error");
+		}
+		return;
 	}
+
+	// Linux: try sushi first, fall back to opening in file manager
+	if (PLATFORM.quickLookCommand) {
+		const result = await pi.exec(PLATFORM.quickLookCommand, PLATFORM.quickLookArgs(target.resolvedPath));
+		if (result.code === 0) return;
+		// If sushi fails, fall through to fallback
+	}
+
+	// Fallback: reveal in file manager (most Linux file managers have preview)
+	ctx.ui.notify("Opening in file manager (install 'sushi' for better quick preview)", "info");
+	await revealPath(pi, ctx, target);
 };
 
 const openDiff = async (pi: ExtensionAPI, ctx: ExtensionContext, target: FileEntry, gitRoot: string | null): Promise<void> => {
@@ -986,7 +1074,7 @@ const runFileBrowser = async (pi: ExtensionAPI, ctx: ExtensionContext): Promise<
 
 		lastSelectedPath = selected.canonicalPath;
 
-		const canQuickLook = process.platform === "darwin" && !selected.isDirectory;
+		const canQuickLook = !selected.isDirectory;
 		const editCheck = getEditableContent(selected);
 		const canDiff = selected.isTracked && !selected.isDirectory && Boolean(gitRoot);
 
@@ -1047,7 +1135,9 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.registerShortcut("ctrl+shift+f", {
-		description: "Reveal the latest file reference in Finder",
+		description: process.platform === "darwin"
+			? "Reveal the latest file reference in Finder"
+			: `Reveal the latest file reference in ${PLATFORM.fileManager}`,
 		handler: async (ctx) => {
 			const entries = ctx.sessionManager.getBranch();
 			const latest = findLatestFileReference(entries, ctx.cwd);
@@ -1080,7 +1170,11 @@ export default function (pi: ExtensionAPI): void {
 	});
 
 	pi.registerShortcut("ctrl+shift+r", {
-		description: "Quick Look the latest file reference",
+		description: process.platform === "darwin"
+			? "Quick Look the latest file reference (qlmanage)"
+			: PLATFORM.quickLookCommand
+				? "Quick Look the latest file reference (sushi)"
+				: "Quick Look the latest file reference (file manager)",
 		handler: async (ctx) => {
 			const entries = ctx.sessionManager.getBranch();
 			const latest = findLatestFileReference(entries, ctx.cwd);
