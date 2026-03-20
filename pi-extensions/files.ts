@@ -29,7 +29,7 @@ import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import {
 	Container,
 	fuzzyFilter,
-	getEditorKeybindings,
+	getKeybindings,
 	Input,
 	matchesKey,
 	type SelectItem,
@@ -162,7 +162,12 @@ const extractFileReferencesFromText = (text: string): string[] => {
 	}
 
 	for (const match of text.matchAll(PATH_REGEX)) {
-		refs.push(match[1]);
+		// PATH_REGEX has multiple capture groups:
+		// match[2] = quoted path content, match[3] = unquoted path (first alt), match[4] = path (second alt)
+		const path = match[2] ?? match[3] ?? match[4];
+		if (path) {
+			refs.push(path);
+		}
 	}
 
 	return refs;
@@ -454,7 +459,7 @@ const getGitRoot = async (pi: ExtensionAPI, cwd: string): Promise<string | null>
 		return null;
 	}
 
-	const root = result.stdout.trim();
+	const root = result.stdout?.trim();
 	return root ? root : null;
 };
 
@@ -1028,7 +1033,7 @@ const showFileSelector = async (
 					}
 				}
 
-				const kb = getEditorKeybindings();
+				const kb = getKeybindings();
 				if (
 					kb.matches(data, "selectUp") ||
 					kb.matches(data, "selectDown") ||
