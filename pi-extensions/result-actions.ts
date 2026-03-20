@@ -16,6 +16,7 @@ import os from "node:os";
 import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@mariozechner/pi-coding-agent";
 import { DynamicBorder } from "@mariozechner/pi-coding-agent";
 import { Container, type SelectItem, SelectList, Text } from "@mariozechner/pi-tui";
+import { openInNautilus } from "./nautilus-open.js";
 
 // Platform-specific quicklook configuration
 type QuickLookConfig = {
@@ -274,7 +275,7 @@ const copyToClipboard = async (pi: ExtensionAPI, ctx: ExtensionContext, text: st
 			return;
 		}
 
-		ctx.ui.notify("Copied to clipboard!", "success");
+		ctx.ui.notify("Copied to clipboard!", "info");
 	} catch (err) {
 		ctx.ui.notify(`Clipboard error: ${err}`, "error");
 	}
@@ -343,97 +344,49 @@ const quickLookAllFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths:
 	}
 };
 
-// Reveal files in Nautilus using D-Bus
-// Groups files by parent directory and opens each directory with its files selected
+// Reveal files in Nautilus using the nautilus-open extension (supports proper multi-select)
 const revealFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths: string[]): Promise<void> => {
 	if (paths.length === 0) {
 		ctx.ui.notify("No files to reveal", "warning");
 		return;
 	}
 
-	// Filter to existing files (not directories - we want to reveal actual files)
-	const existingFiles = paths.filter((p) => {
+	// Filter to existing files/directories
+	const existingPaths = paths.filter((p) => {
 		try {
-			return existsSync(p) && !statSync(p).isDirectory();
+			return existsSync(p);
 		} catch {
 			return false;
 		}
 	});
 
-	if (existingFiles.length === 0) {
+	if (existingPaths.length === 0) {
 		ctx.ui.notify("No valid files found to reveal", "warning");
 		return;
 	}
 
-	// Group files by parent directory
-	const filesByDir = new Map<string, string[]>();
-	for (const filePath of existingFiles) {
-		const dir = path.dirname(filePath);
-		if (!filesByDir.has(dir)) {
-			filesByDir.set(dir, []);
-		}
-		filesByDir.get(dir)!.push(filePath);
-	}
+	// Use the nautilus-open extension for proper multi-file selection
+	const result = await openInNautilus(existingPaths, pi);
 
-	let successCount = 0;
-
-	// Open each directory with its files selected
-	for (const [_dir, files] of filesByDir) {
-		// Build file:// URIs for files in this directory
-		const uris = files.map((p) => `file://${p}`);
-		const uriArray = `['${uris.join("','")}']`;
-
-		try {
-			const result = await pi.exec("gdbus", [
-				"call",
-				"--session",
-				"--dest",
-				"org.gnome.Nautilus",
-				"--object-path",
-				"/org/freedesktop/FileManager1",
-				"--method",
-				"org.freedesktop.FileManager1.ShowItems",
-				uriArray,
-				"",
-			]);
-
-			if (result.code === 0) {
-				successCount += files.length;
-			} else {
-				// Fallback: use nautilus directly with --select
-				for (const filePath of files) {
-					const fallbackResult = await pi.exec("nautilus", ["--select", filePath]);
-					if (fallbackResult.code === 0) {
-						successCount++;
-					}
-				}
-			}
-		} catch {
-			// Fallback: use nautilus directly with --select
-			for (const filePath of files) {
-				try {
-					const fallbackResult = await pi.exec("nautilus", ["--select", filePath]);
-					if (fallbackResult.code === 0) {
-						successCount++;
-					}
-				} catch {
-					// Ignore individual file errors
-				}
-			}
-		}
-
-		// Small delay between directory opens to prevent race conditions
-		if (filesByDir.size > 1) {
-			await new Promise((resolve) => setTimeout(resolve, 300));
-		}
-	}
-
-	if (successCount > 0) {
-		const dirCount = filesByDir.size;
-		const dirMsg = dirCount > 1 ? ` in ${dirCount} folders` : "";
-		ctx.ui.notify(`Revealed ${successCount} file${successCount > 1 ? "s" : ""}${dirMsg} in Nautilus`, "success");
+	if (result.success) {
+		const dirMsg = result.directoriesOpened > 1
+			? ` in ${result.directoriesOpened} folders`
+			: "";
+		const extMsg = result.hasExtension ? "" : " (single-select mode)";
+		ctx.ui.notify(
+			`Revealed ${result.filesOpened} file${result.filesOpened > 1 ? "s" : ""}${dirMsg}${extMsg}`,
+			"info"
+		);
 	} else {
-		ctx.ui.notify("Failed to reveal files in Nautilus", "error");
+		// Fallback: open the directory containing the first file
+		try {
+			const firstFile = existingPaths[0];
+			const dir = statSync(firstFile).isDirectory() ? firstFile : path.dirname(firstFile);
+			await pi.exec("xdg-open", [dir]);
+			ctx.ui.notify(`Opened folder (Nautilus integration failed)`, "warning");
+		} catch (err) {
+			ctx.ui.notify(`Failed to reveal files: ${result.errors.join("; ")}`, "error");
+		}
 	}
 };
 
@@ -479,7 +432,7 @@ const openAllFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths: stri
 
 	if (existingFiles.length === 1) {
 		await openFile(pi, ctx, existingFiles[0]);
-		ctx.ui.notify(`Opened ${path.basename(existingFiles[0])}`, "success");
+		ctx.ui.notify(`Opened ${path.basename(existingFiles[0])}`, "info");
 		return;
 	}
 
@@ -490,7 +443,7 @@ const openAllFiles = async (pi: ExtensionAPI, ctx: ExtensionContext, paths: stri
 		// Small delay between opens to not overwhelm the system
 		await new Promise((resolve) => setTimeout(resolve, 300));
 	}
-	ctx.ui.notify(`Opened ${existingFiles.length} files`, "success");
+	ctx.ui.notify(`Opened ${existingFiles.length} files`, "info");
 };
 
 // Show action selector UI
