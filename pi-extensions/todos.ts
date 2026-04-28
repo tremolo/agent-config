@@ -29,13 +29,23 @@
  * Use `/todos` to bring up the visual todo manager or just let the LLM use them
  * naturally.
  */
-import { DynamicBorder, copyToClipboard, getMarkdownTheme, keyHint, type ExtensionAPI, type ExtensionContext, type Theme } from "@mariozechner/pi-coding-agent";
+import {
+	DynamicBorder,
+	copyToClipboard,
+	getMarkdownTheme,
+	type ExtensionAPI,
+	type ExtensionCommandContext,
+	type ExtensionContext,
+	type Theme,
+} from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "@sinclair/typebox";
 import path from "node:path";
 import fs from "node:fs/promises";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, watch, type FSWatcher } from "node:fs";
 import crypto from "node:crypto";
+import net from "node:net";
+import os from "node:os";
 import {
 	Container,
 	type Focusable,
@@ -56,6 +66,7 @@ import {
 const TODO_DIR_NAME = ".pi/todos";
 const TODO_PATH_ENV = "PI_TODO_PATH";
 const TODO_SETTINGS_NAME = "settings.json";
+const TODO_INDEX_NAME = "index.json";
 const TODO_ID_PREFIX = "TODO-";
 const TODO_ID_PATTERN = /^[a-f0-9]{8}$/i;
 const DEFAULT_TODO_SETTINGS = {
@@ -63,6 +74,9 @@ const DEFAULT_TODO_SETTINGS = {
 	gcDays: 7,
 };
 const LOCK_TTL_MS = 30 * 60 * 1000;
+const MPMUX_SOCKET_ENV = "MPMUX_SOCKET_PATH";
+const MPMUX_DEFAULT_SOCKET_NAME = "mpmux.sock";
+const MPMUX_HOST_TIMEOUT_MS = 5_000;
 
 interface TodoFrontMatter {
 	id: string;
@@ -70,7 +84,11 @@ interface TodoFrontMatter {
 	tags: string[];
 	status: string;
 	created_at: string;
+	updated_at?: string;
+	group_colour?: string;
 	assigned_to_session?: string;
+	last_worked_at?: string;
+	last_worked_by_session?: string;
 }
 
 interface TodoRecord extends TodoFrontMatter {
@@ -89,8 +107,139 @@ interface TodoSettings {
 	gcDays: number;
 }
 
+type TodoRelationshipKind =
+	| "parent"
+	| "child"
+	| "depends_on"
+	| "blocks"
+	| "related_to"
+	| "duplicate_of"
+	| "umbrella"
+	| "subtask";
+
+type TodoRelationshipEdge = {
+	from: string;
+	to: string;
+	kind: TodoRelationshipKind;
+	source: "structured-text" | "explicit-reference" | "computed";
+	context?: string;
+};
+
+type TodoIndexItem = TodoFrontMatter & {
+	display_id: string;
+	closed: boolean;
+};
+
+type TodoIndexGraphNode = {
+	id: string;
+	parent_ids: string[];
+	child_ids: string[];
+	sibling_ids: string[];
+	depends_on: string[];
+	blocks: string[];
+	related_to: string[];
+	duplicate_of: string[];
+};
+
+type TodoIndex = {
+	version: 1;
+	generated_at: string;
+	summary: {
+		total: number;
+		open: number;
+		closed: number;
+		visible_default_limit: number;
+	};
+	todos: TodoIndexItem[];
+	groups: {
+		tags: Record<string, string[]>;
+		status: Record<string, string[]>;
+		recently_worked: string[];
+	};
+	graph: {
+		edges: TodoRelationshipEdge[];
+		nodes: Record<string, TodoIndexGraphNode>;
+	};
+};
+
 type KeybindingMatcher = {
 	matches: (keyData: string, keybindingId: string) => boolean;
+};
+
+type TodoSelectionChangeCallback = (
+	todo: TodoFrontMatter | null,
+	state: { search: string; filteredTodos: TodoFrontMatter[] },
+) => void;
+
+type MpmuxHostSidebarState = {
+	socketPath: string;
+	clientId: string;
+	attached: boolean;
+};
+
+type MpmuxHostEventKind =
+	| "control-owner-changed"
+	| "ui-state-changed"
+	| "dialog-state-changed"
+	| "custom-dialog-state-changed"
+	| "custom-sidebar-state-changed";
+
+type MpmuxCustomSidebarInteraction = {
+	nonce: number;
+	kind: "selection-changed" | "item-invoked";
+	source?: string;
+	section_id?: string;
+	item_id?: string;
+};
+
+type MpmuxCustomSidebarState = {
+	open: boolean;
+	id?: string;
+	title?: string;
+	section_count: number;
+	rendered_text?: string;
+	selected_item_id?: string;
+	last_interaction?: MpmuxCustomSidebarInteraction;
+};
+
+type MpmuxCustomDialogActionEvent = {
+	nonce: number;
+	result: {
+		dialog_id: string;
+		action_id: string;
+		submitted: boolean;
+		values: Array<{ field_id: string; value: unknown }>;
+	};
+};
+
+type MpmuxCustomDialogState = {
+	open: boolean;
+	id?: string;
+	title?: string;
+	last_action?: MpmuxCustomDialogActionEvent;
+};
+
+type MpmuxUiState = {
+	message_sidebar: {
+		open: boolean;
+		maximize_mode: boolean;
+		visible_width_px?: number;
+	};
+	custom_sidebar: MpmuxCustomSidebarState;
+	custom_dialog: MpmuxCustomDialogState;
+};
+
+type MpmuxHostEvent = {
+	kind: MpmuxHostEventKind;
+	ui_state?: MpmuxUiState;
+	custom_sidebar?: MpmuxCustomSidebarState;
+	custom_dialog?: MpmuxCustomDialogState;
+};
+
+type MpmuxHostPollEventsResponse = {
+	client_id: string;
+	events: MpmuxHostEvent[];
+	pending_event_count: number;
 };
 
 const TodoParams = Type.Object({
@@ -104,6 +253,7 @@ const TodoParams = Type.Object({
 		"delete",
 		"claim",
 		"release",
+		"refresh-index",
 	] as const),
 	id: Type.Optional(
 		Type.String({ description: "Todo id (TODO-<hex> or raw hex filename)" }),
@@ -111,6 +261,7 @@ const TodoParams = Type.Object({
 	title: Type.Optional(Type.String({ description: "Short summary shown in lists" })),
 	status: Type.Optional(Type.String({ description: "Todo status" })),
 	tags: Type.Optional(Type.Array(Type.String({ description: "Todo tag" }))),
+	group_colour: Type.Optional(Type.String({ description: "Optional parent/group colour as #rrggbb for sidebar relationship accents" })),
 	body: Type.Optional(
 		Type.String({ description: "Long-form details (markdown). Update replaces; append adds." }),
 	),
@@ -126,7 +277,8 @@ type TodoAction =
 	| "append"
 	| "delete"
 	| "claim"
-	| "release";
+	| "release"
+	| "refresh-index";
 
 type TodoOverlayAction = "back" | "work";
 
@@ -143,6 +295,7 @@ type TodoMenuAction =
 
 type TodoToolDetails =
 	| { action: "list" | "list-all"; todos: TodoFrontMatter[]; currentSessionId?: string; error?: string }
+	| { action: "refresh-index"; index: TodoIndex; error?: string }
 	| {
 			action: "get" | "create" | "update" | "append" | "delete" | "claim" | "release";
 			todo: TodoRecord;
@@ -201,7 +354,8 @@ function sortTodos(todos: TodoFrontMatter[]): TodoFrontMatter[] {
 function buildTodoSearchText(todo: TodoFrontMatter): string {
 	const tags = todo.tags.join(" ");
 	const assignment = todo.assigned_to_session ? `assigned:${todo.assigned_to_session}` : "";
-	return `${formatTodoId(todo.id)} ${todo.id} ${todo.title} ${tags} ${todo.status} ${assignment}`.trim();
+	const workedBy = todo.last_worked_by_session ? `worked:${todo.last_worked_by_session}` : "";
+	return `${formatTodoId(todo.id)} ${todo.id} ${todo.title} ${tags} ${todo.status} ${assignment} ${workedBy} ${todo.updated_at ?? ""}`.trim();
 }
 
 function filterTodos(todos: TodoFrontMatter[], query: string): TodoFrontMatter[] {
@@ -280,6 +434,7 @@ class TodoSelectorComponent extends Container implements Focusable {
 		initialSearchInput?: string,
 		currentSessionId?: string,
 		private onQuickAction?: (todo: TodoFrontMatter, action: "work" | "refine") => void,
+		private onSelectionChange?: TodoSelectionChangeCallback,
 	) {
 		super();
 		this.tui = tui;
@@ -334,6 +489,10 @@ class TodoSelectorComponent extends Container implements Focusable {
 		return this.searchInput.getValue();
 	}
 
+	getSelectedTodo(): TodoFrontMatter | null {
+		return this.filteredTodos[this.selectedIndex] ?? null;
+	}
+
 	private updateHeader(): void {
 		const openCount = this.allTodos.filter((todo) => !isTodoClosed(todo.status)).length;
 		const closedCount = this.allTodos.length - openCount;
@@ -354,6 +513,14 @@ class TodoSelectorComponent extends Container implements Focusable {
 		this.filteredTodos = filterTodos(this.allTodos, query);
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredTodos.length - 1));
 		this.updateList();
+		this.emitSelectionChange();
+	}
+
+	private emitSelectionChange(): void {
+		this.onSelectionChange?.(this.getSelectedTodo(), {
+			search: this.getSearchValue(),
+			filteredTodos: [...this.filteredTodos],
+		});
 	}
 
 	private updateList(): void {
@@ -408,12 +575,14 @@ class TodoSelectorComponent extends Container implements Focusable {
 			if (this.filteredTodos.length === 0) return;
 			this.selectedIndex = this.selectedIndex === 0 ? this.filteredTodos.length - 1 : this.selectedIndex - 1;
 			this.updateList();
+			this.emitSelectionChange();
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.down")) {
 			if (this.filteredTodos.length === 0) return;
 			this.selectedIndex = this.selectedIndex === this.filteredTodos.length - 1 ? 0 : this.selectedIndex + 1;
 			this.updateList();
+			this.emitSelectionChange();
 			return;
 		}
 		if (kb.matches(keyData, "tui.select.confirm")) {
@@ -804,6 +973,13 @@ function getLockPath(todosDir: string, id: string): string {
 	return path.join(todosDir, `${id}.lock`);
 }
 
+function normalizeTodoGroupColour(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	const match = /^#?([0-9a-f]{6})$/i.exec(trimmed);
+	return match ? `#${match[1].toLowerCase()}` : undefined;
+}
+
 function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 	const data: TodoFrontMatter = {
 		id: idFallback,
@@ -811,7 +987,11 @@ function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 		tags: [],
 		status: "open",
 		created_at: "",
+		updated_at: undefined,
+		group_colour: undefined,
 		assigned_to_session: undefined,
+		last_worked_at: undefined,
+		last_worked_by_session: undefined,
 	};
 
 	const trimmed = text.trim();
@@ -824,6 +1004,14 @@ function parseFrontMatter(text: string, idFallback: string): TodoFrontMatter {
 		if (typeof parsed.title === "string") data.title = parsed.title;
 		if (typeof parsed.status === "string" && parsed.status) data.status = parsed.status;
 		if (typeof parsed.created_at === "string") data.created_at = parsed.created_at;
+		if (typeof parsed.updated_at === "string" && parsed.updated_at.trim()) data.updated_at = parsed.updated_at;
+		if (typeof parsed.group_colour === "string" && normalizeTodoGroupColour(parsed.group_colour)) {
+			data.group_colour = normalizeTodoGroupColour(parsed.group_colour);
+		}
+		if (typeof parsed.last_worked_at === "string" && parsed.last_worked_at.trim()) data.last_worked_at = parsed.last_worked_at;
+		if (typeof parsed.last_worked_by_session === "string" && parsed.last_worked_by_session.trim()) {
+			data.last_worked_by_session = parsed.last_worked_by_session;
+		}
 		if (typeof parsed.assigned_to_session === "string" && parsed.assigned_to_session.trim()) {
 			data.assigned_to_session = parsed.assigned_to_session;
 		}
@@ -903,9 +1091,22 @@ function parseTodoContent(content: string, idFallback: string): TodoRecord {
 		tags: parsed.tags ?? [],
 		status: parsed.status,
 		created_at: parsed.created_at,
+		updated_at: parsed.updated_at,
+		group_colour: parsed.group_colour,
 		assigned_to_session: parsed.assigned_to_session,
+		last_worked_at: parsed.last_worked_at,
+		last_worked_by_session: parsed.last_worked_by_session,
 		body: body ?? "",
 	};
+}
+
+function markTodoUpdated(todo: TodoRecord, timestamp = new Date().toISOString()): void {
+	todo.updated_at = timestamp;
+}
+
+function markTodoWorked(todo: TodoRecord, sessionId: string, timestamp = new Date().toISOString()): void {
+	todo.last_worked_at = timestamp;
+	todo.last_worked_by_session = sessionId;
 }
 
 function serializeTodo(todo: TodoRecord): string {
@@ -916,7 +1117,11 @@ function serializeTodo(todo: TodoRecord): string {
 			tags: todo.tags ?? [],
 			status: todo.status,
 			created_at: todo.created_at,
+			updated_at: todo.updated_at || undefined,
+			group_colour: normalizeTodoGroupColour(todo.group_colour),
 			assigned_to_session: todo.assigned_to_session || undefined,
+			last_worked_at: todo.last_worked_at || undefined,
+			last_worked_by_session: todo.last_worked_by_session || undefined,
 		},
 		null,
 		2,
@@ -1043,7 +1248,10 @@ async function listTodos(todosDir: string): Promise<TodoFrontMatter[]> {
 		const id = entry.slice(0, -3);
 		const filePath = path.join(todosDir, entry);
 		try {
-			const content = await fs.readFile(filePath, "utf8");
+			const [content, stats] = await Promise.all([
+				fs.readFile(filePath, "utf8"),
+				fs.stat(filePath),
+			]);
 			const { frontMatter } = splitFrontMatter(content);
 			const parsed = parseFrontMatter(frontMatter, id);
 			todos.push({
@@ -1052,7 +1260,11 @@ async function listTodos(todosDir: string): Promise<TodoFrontMatter[]> {
 				tags: parsed.tags ?? [],
 				status: parsed.status,
 				created_at: parsed.created_at,
+				updated_at: parsed.updated_at || stats.mtime.toISOString(),
+				group_colour: parsed.group_colour,
 				assigned_to_session: parsed.assigned_to_session,
+				last_worked_at: parsed.last_worked_at,
+				last_worked_by_session: parsed.last_worked_by_session,
 			});
 		} catch {
 			// ignore unreadable todo
@@ -1060,6 +1272,311 @@ async function listTodos(todosDir: string): Promise<TodoFrontMatter[]> {
 	}
 
 	return sortTodos(todos);
+}
+
+async function listTodoRecords(todosDir: string): Promise<TodoRecord[]> {
+	let entries: string[] = [];
+	try {
+		entries = await fs.readdir(todosDir);
+	} catch {
+		return [];
+	}
+
+	const todos: TodoRecord[] = [];
+	for (const entry of entries) {
+		if (!entry.endsWith(".md")) continue;
+		const id = entry.slice(0, -3);
+		const filePath = path.join(todosDir, entry);
+		try {
+			const [content, stats] = await Promise.all([
+				fs.readFile(filePath, "utf8"),
+				fs.stat(filePath),
+			]);
+			const todo = parseTodoContent(content, id);
+			if (!todo.updated_at) todo.updated_at = stats.mtime.toISOString();
+			todos.push(todo);
+		} catch {
+			// ignore unreadable todo
+		}
+	}
+
+	return sortTodos(todos) as TodoRecord[];
+}
+
+function getTodoIndexPath(todosDir: string): string {
+	return path.join(todosDir, TODO_INDEX_NAME);
+}
+
+function todoActivityTimestamp(todo: TodoFrontMatter): string {
+	return todo.last_worked_at || todo.updated_at || todo.created_at || "";
+}
+
+function compareTodoActivityDesc(a: TodoFrontMatter, b: TodoFrontMatter): number {
+	return todoActivityTimestamp(b).localeCompare(todoActivityTimestamp(a));
+}
+
+function pushUnique(items: string[], id: string): void {
+	if (!items.includes(id)) items.push(id);
+}
+
+function pushRelationshipEdge(edges: TodoRelationshipEdge[], edge: TodoRelationshipEdge): void {
+	if (edge.from === edge.to) return;
+	const exists = edges.some(
+		(existing) =>
+			existing.from === edge.from && existing.to === edge.to && existing.kind === edge.kind,
+	);
+	if (!exists) edges.push(edge);
+}
+
+function extractTodoIds(text: string): string[] {
+	const ids = new Set<string>();
+	const pattern = /(?:TODO-)?([a-f0-9]{8})/gi;
+	let match: RegExpExecArray | null;
+	while ((match = pattern.exec(text)) !== null) {
+		ids.add(match[1].toLowerCase());
+	}
+	return [...ids];
+}
+
+function relationshipKindsForLine(line: string): TodoRelationshipKind[] {
+	const normalized = line.toLowerCase();
+	const kinds: TodoRelationshipKind[] = [];
+	if (/\bumbrella\b/.test(normalized)) kinds.push("umbrella");
+	else if (/\b(parent|parents)\b/.test(normalized)) kinds.push("parent");
+	if (/\b(subtask|subtasks)\b/.test(normalized)) kinds.push("subtask");
+	else if (/\b(child|children)\b/.test(normalized)) kinds.push("child");
+	if (/\b(depends on|dependency|dependencies|blocked by|requires)\b/.test(normalized)) {
+		kinds.push("depends_on");
+	}
+	if (/\b(blocks|blocking)\b/.test(normalized)) kinds.push("blocks");
+	if (/\b(related|see also|sibling)\b/.test(normalized)) kinds.push("related_to");
+	if (/\b(duplicate|dupe)\b/.test(normalized)) kinds.push("duplicate_of");
+	return kinds;
+}
+
+function relationshipEdgesForTodo(todo: TodoRecord, knownTodoIds: Set<string>): TodoRelationshipEdge[] {
+	const edges: TodoRelationshipEdge[] = [];
+	const lines = todo.body.split(/\r?\n/);
+	for (const rawLine of lines) {
+		const referencedIds = extractTodoIds(rawLine).filter(
+			(id) => id !== todo.id && knownTodoIds.has(id),
+		);
+		if (!referencedIds.length) continue;
+		const kinds = relationshipKindsForLine(rawLine);
+		const context = rawLine.trim();
+		for (const referencedId of referencedIds) {
+			if (kinds.length === 0) {
+				pushRelationshipEdge(edges, {
+					from: todo.id,
+					to: referencedId,
+					kind: "related_to",
+					source: "explicit-reference",
+					context,
+				});
+				continue;
+			}
+			for (const kind of kinds) {
+				if (kind === "parent" || kind === "umbrella") {
+					if (kind === "umbrella") {
+						pushRelationshipEdge(edges, {
+							from: referencedId,
+							to: todo.id,
+							kind: "umbrella",
+							source: "structured-text",
+							context,
+						});
+					}
+					pushRelationshipEdge(edges, {
+						from: referencedId,
+						to: todo.id,
+						kind: "parent",
+						source: "structured-text",
+						context,
+					});
+					pushRelationshipEdge(edges, {
+						from: todo.id,
+						to: referencedId,
+						kind: "child",
+						source: "computed",
+						context,
+					});
+					continue;
+				}
+				if (kind === "child" || kind === "subtask") {
+					if (kind === "subtask") {
+						pushRelationshipEdge(edges, {
+							from: todo.id,
+							to: referencedId,
+							kind: "subtask",
+							source: "structured-text",
+							context,
+						});
+					}
+					pushRelationshipEdge(edges, {
+						from: todo.id,
+						to: referencedId,
+						kind: "parent",
+						source: "structured-text",
+						context,
+					});
+					pushRelationshipEdge(edges, {
+						from: referencedId,
+						to: todo.id,
+						kind: "child",
+						source: "computed",
+						context,
+					});
+					continue;
+				}
+				if (kind === "depends_on") {
+					pushRelationshipEdge(edges, {
+						from: todo.id,
+						to: referencedId,
+						kind,
+						source: "structured-text",
+						context,
+					});
+					pushRelationshipEdge(edges, {
+						from: referencedId,
+						to: todo.id,
+						kind: "blocks",
+						source: "computed",
+						context,
+					});
+					continue;
+				}
+				if (kind === "blocks") {
+					pushRelationshipEdge(edges, {
+						from: todo.id,
+						to: referencedId,
+						kind,
+						source: "structured-text",
+						context,
+					});
+					pushRelationshipEdge(edges, {
+						from: referencedId,
+						to: todo.id,
+						kind: "depends_on",
+						source: "computed",
+						context,
+					});
+					continue;
+				}
+				pushRelationshipEdge(edges, {
+					from: todo.id,
+					to: referencedId,
+					kind,
+					source: "structured-text",
+					context,
+				});
+			}
+		}
+	}
+	return edges;
+}
+
+function createEmptyTodoGraphNode(id: string): TodoIndexGraphNode {
+	return {
+		id,
+		parent_ids: [],
+		child_ids: [],
+		sibling_ids: [],
+		depends_on: [],
+		blocks: [],
+		related_to: [],
+		duplicate_of: [],
+	};
+}
+
+function buildTodoIndex(todos: TodoRecord[]): TodoIndex {
+	const knownTodoIds = new Set(todos.map((todo) => todo.id));
+	const sortedTodos = [...todos].sort(compareTodoActivityDesc);
+	const tagGroups: Record<string, string[]> = {};
+	const statusGroups: Record<string, string[]> = {};
+	const nodes: Record<string, TodoIndexGraphNode> = {};
+	const edges: TodoRelationshipEdge[] = [];
+
+	for (const todo of sortedTodos) {
+		nodes[todo.id] = createEmptyTodoGraphNode(todo.id);
+		const status = getTodoStatus(todo);
+		(statusGroups[status] ??= []).push(todo.id);
+		for (const tag of todo.tags.length ? todo.tags : ["untagged"]) {
+			(tagGroups[tag] ??= []).push(todo.id);
+		}
+	}
+
+	for (const todo of todos) {
+		for (const edge of relationshipEdgesForTodo(todo, knownTodoIds)) {
+			pushRelationshipEdge(edges, edge);
+		}
+	}
+
+	for (const edge of edges) {
+		const fromNode = nodes[edge.from];
+		const toNode = nodes[edge.to];
+		if (!fromNode || !toNode) continue;
+		if (edge.kind === "parent") pushUnique(fromNode.child_ids, edge.to);
+		if (edge.kind === "parent") pushUnique(toNode.parent_ids, edge.from);
+		if (edge.kind === "child") pushUnique(fromNode.parent_ids, edge.to);
+		if (edge.kind === "child") pushUnique(toNode.child_ids, edge.from);
+		if (edge.kind === "depends_on") pushUnique(fromNode.depends_on, edge.to);
+		if (edge.kind === "blocks") pushUnique(fromNode.blocks, edge.to);
+		if (edge.kind === "related_to") pushUnique(fromNode.related_to, edge.to);
+		if (edge.kind === "duplicate_of") pushUnique(fromNode.duplicate_of, edge.to);
+	}
+
+	for (const node of Object.values(nodes)) {
+		for (const parentId of node.parent_ids) {
+			const parent = nodes[parentId];
+			if (!parent) continue;
+			for (const siblingId of parent.child_ids) {
+				if (siblingId !== node.id) pushUnique(node.sibling_ids, siblingId);
+			}
+		}
+	}
+
+	const items: TodoIndexItem[] = sortedTodos.map((todo) => ({
+		id: todo.id,
+		display_id: formatTodoId(todo.id),
+		title: todo.title,
+		tags: todo.tags,
+		status: getTodoStatus(todo),
+		created_at: todo.created_at,
+		updated_at: todo.updated_at,
+		group_colour: todo.group_colour,
+		assigned_to_session: todo.assigned_to_session,
+		last_worked_at: todo.last_worked_at,
+		last_worked_by_session: todo.last_worked_by_session,
+		closed: isTodoClosed(getTodoStatus(todo)),
+	}));
+
+	return {
+		version: 1,
+		generated_at: new Date().toISOString(),
+		summary: {
+			total: todos.length,
+			open: todos.filter((todo) => !isTodoClosed(getTodoStatus(todo))).length,
+			closed: todos.filter((todo) => isTodoClosed(getTodoStatus(todo))).length,
+			visible_default_limit: 10,
+		},
+		todos: items,
+		groups: {
+			tags: tagGroups,
+			status: statusGroups,
+			recently_worked: sortedTodos
+				.filter((todo) => Boolean(todo.last_worked_at))
+				.map((todo) => todo.id),
+		},
+		graph: { edges, nodes },
+	};
+}
+
+async function refreshTodoIndex(todosDir: string): Promise<TodoIndex> {
+	await ensureTodosDir(todosDir);
+	const todos = await listTodoRecords(todosDir);
+	const index = buildTodoIndex(todos);
+	await fs.writeFile(getTodoIndexPath(todosDir), `${JSON.stringify(index, null, 2)}\n`, "utf8");
+	return index;
 }
 
 function listTodosSync(todosDir: string): TodoFrontMatter[] {
@@ -1077,6 +1594,7 @@ function listTodosSync(todosDir: string): TodoFrontMatter[] {
 		const filePath = path.join(todosDir, entry);
 		try {
 			const content = readFileSync(filePath, "utf8");
+			const stats = statSync(filePath);
 			const { frontMatter } = splitFrontMatter(content);
 			const parsed = parseFrontMatter(frontMatter, id);
 			todos.push({
@@ -1085,7 +1603,11 @@ function listTodosSync(todosDir: string): TodoFrontMatter[] {
 				tags: parsed.tags ?? [],
 				status: parsed.status,
 				created_at: parsed.created_at,
+				updated_at: parsed.updated_at || stats.mtime.toISOString(),
+				group_colour: parsed.group_colour,
 				assigned_to_session: parsed.assigned_to_session,
+				last_worked_at: parsed.last_worked_at,
+				last_worked_by_session: parsed.last_worked_by_session,
 			});
 		} catch {
 			// ignore
@@ -1262,6 +1784,8 @@ function renderTodoDetail(theme: Theme, todo: TodoRecord, expanded: boolean): st
 		theme.fg("muted", `Status: ${getTodoStatus(todo)}`),
 		theme.fg("muted", `Tags: ${tags}`),
 		theme.fg("muted", `Created: ${createdAt}`),
+		theme.fg("muted", `Updated: ${todo.updated_at || "unknown"}`),
+		...(todo.last_worked_at ? [theme.fg("muted", `Last worked: ${todo.last_worked_at}`)] : []),
 		"",
 		theme.fg("muted", "Body:"),
 		...bodyLines.map((line) => theme.fg("text", `  ${line}`)),
@@ -1271,7 +1795,489 @@ function renderTodoDetail(theme: Theme, todo: TodoRecord, expanded: boolean): st
 }
 
 function appendExpandHint(theme: Theme, text: string): string {
-	return `${text}\n${theme.fg("dim", `(${keyHint("app.tools.expand", "to expand")})`)}`;
+	return `${text}\n${theme.fg("dim", "(expand for more)")}`;
+}
+
+function truncatePlainText(text: string, maxLength: number): string {
+	const trimmed = text.trim().replace(/\s+/g, " ");
+	if (trimmed.length <= maxLength) return trimmed;
+	return `${trimmed.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function todoSnippet(todo: TodoRecord, maxLength = 72): string {
+	const firstLine = todo.body
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.find(Boolean);
+	if (firstLine) return truncatePlainText(firstLine, maxLength);
+	if (todo.tags.length) return truncatePlainText(`tags: ${todo.tags.join(", ")}`, maxLength);
+	return "No details yet";
+}
+
+function formatTodoAssignmentLabel(todo: TodoFrontMatter, currentSessionId?: string): string | null {
+	if (!todo.assigned_to_session) return null;
+	if (todo.assigned_to_session === currentSessionId) return "Assigned to current session";
+	return `Assigned to ${todo.assigned_to_session}`;
+}
+
+function hashTodoIdToPaletteIndex(id: string, paletteLength: number): number {
+	let hash = 0;
+	for (const char of id) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+	return Math.abs(hash) % paletteLength;
+}
+
+const TODO_GROUP_COLOUR_PALETTE = [
+	"#6e8bff",
+	"#57b8a5",
+	"#b18cff",
+	"#d79a52",
+	"#d36a8f",
+	"#7aa66a",
+];
+const TODO_LEAF_COLOUR = "#5f6874";
+
+function todoGroupColourForRoot(todo: TodoRecord): string {
+	return normalizeTodoGroupColour(todo.group_colour)
+		?? TODO_GROUP_COLOUR_PALETTE[hashTodoIdToPaletteIndex(todo.id, TODO_GROUP_COLOUR_PALETTE.length)];
+}
+
+function todoSidebarStatusWithAccent(status: string, colour: string): string {
+	return `${status}|accent:${colour}`;
+}
+
+function todoSidebarChildStatus(status: string, colour: string): string {
+	return `${todoSidebarStatusWithAccent(status, colour)}|level:1`;
+}
+
+function todoIndexRootId(index: TodoIndex, todoId: string): string | null {
+	let current = normalizeTodoId(todoId);
+	const visited = new Set<string>();
+	while (current && !visited.has(current)) {
+		visited.add(current);
+		const node = index.graph.nodes[current];
+		if (!node) return null;
+		const parentId = node.parent_ids[0];
+		if (!parentId) return current;
+		current = parentId;
+	}
+	return current || null;
+}
+
+function buildTodoSidebarDetailLines(
+	todo: TodoRecord,
+	currentSessionId?: string,
+	maxBodyLines = 10,
+): string[] {
+	const lines = [
+		formatTodoId(todo.id),
+		`Title: ${todo.title || "(untitled)"}`,
+		`Status: ${getTodoStatus(todo)}`,
+		`Tags: ${todo.tags.length ? todo.tags.join(", ") : "none"}`,
+		`Created: ${todo.created_at || "unknown"}`,
+		`Updated: ${todo.updated_at || "unknown"}`,
+	];
+	if (todo.last_worked_at) {
+		lines.push(`Last worked: ${todo.last_worked_at}`);
+	}
+	const assignment = formatTodoAssignmentLabel(todo, currentSessionId);
+	if (assignment) lines.push(assignment);
+	lines.push("");
+	const bodyText = todo.body?.trim() ? todo.body.trim() : "No details yet.";
+	for (const line of bodyText.split(/\r?\n/).slice(0, maxBodyLines)) {
+		lines.push(line);
+	}
+	return lines;
+}
+
+function buildTodoSidebarSurface(
+	todos: TodoRecord[],
+	selectedTodo: TodoRecord | null,
+	search: string,
+	currentSessionId?: string,
+	options?: { expanded?: boolean; expandedRootIds?: ReadonlySet<string>; collapsedRootIds?: ReadonlySet<string> },
+) {
+	const expanded = options?.expanded ?? false;
+	const expandedRootIds = options?.expandedRootIds;
+	const collapsedRootIds = options?.collapsedRootIds;
+	const openTodos = todos.filter((todo) => !isTodoClosed(getTodoStatus(todo)));
+	const assignedTodos = openTodos.filter((todo) => Boolean(todo.assigned_to_session));
+	const index = buildTodoIndex(openTodos);
+	const todoById = new Map(openTodos.map((todo) => [todo.id, todo] as const));
+	const recentlyWorkedRootIds = index.groups.recently_worked
+		.map((id) => index.graph.nodes[id]?.parent_ids[0] ?? id)
+		.filter((id) => todoById.has(id))
+		.filter((id, position, ids) => ids.indexOf(id) === position);
+	const detailTodo = selectedTodo && !isTodoClosed(getTodoStatus(selectedTodo))
+		? selectedTodo
+		: openTodos[0] ?? todos[0] ?? null;
+	const selectedRootId = detailTodo
+		? index.graph.nodes[detailTodo.id]?.parent_ids[0] ?? detailTodo.id
+		: null;
+
+	const buildListItems = (items: TodoRecord[]) =>
+		items.map((todo) => ({
+			id: todo.id,
+			title: `${formatTodoId(todo.id)} ${todo.title || "(untitled)"}`,
+			subtitle: todoSnippet(todo),
+			status: todoSidebarStatusWithAccent(getTodoStatus(todo), normalizeTodoGroupColour(todo.group_colour) ?? TODO_LEAF_COLOUR),
+		}));
+
+	const buildTreeItems = () => {
+		const rootIds = Object.values(index.graph.nodes)
+			.filter((node) => node.parent_ids.length === 0 && todoById.has(node.id))
+			.map((node) => node.id)
+			.sort((a, b) => compareTodoActivityDesc(todoById.get(a)!, todoById.get(b)!));
+		const orderedRootIds = [
+			...recentlyWorkedRootIds.filter((id) => rootIds.includes(id)),
+			...rootIds.filter((id) => !recentlyWorkedRootIds.includes(id)),
+		];
+		const items: Array<{ id: string; title: string; subtitle: string; status: string }> = [];
+		const maxVisible = expanded ? Number.POSITIVE_INFINITY : 10;
+
+		for (const rootId of orderedRootIds) {
+			const root = todoById.get(rootId);
+			const node = index.graph.nodes[rootId];
+			if (!root || !node) continue;
+			const collapsedRoot = collapsedRootIds?.has(rootId) ?? false;
+			const expandedRoot = !collapsedRoot && (expanded || expandedRootIds?.has(rootId) || rootId === selectedRootId);
+			const visibleChildIds = node.child_ids.filter((childId) => todoById.has(childId));
+			const childCount = visibleChildIds.length;
+			const groupColour = childCount ? todoGroupColourForRoot(root) : TODO_LEAF_COLOUR;
+			items.push({
+				id: root.id,
+				title: `${expandedRoot ? "▾" : "▸"} ${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
+				subtitle: childCount ? `${childCount} child todo${childCount === 1 ? "" : "s"}` : todoSnippet(root),
+				status: todoSidebarStatusWithAccent(getTodoStatus(root), groupColour),
+			});
+			if (expandedRoot) {
+				const childIds = visibleChildIds.sort((a, b) =>
+					compareTodoActivityDesc(todoById.get(a)!, todoById.get(b)!),
+				);
+				for (const childId of childIds) {
+					const child = todoById.get(childId);
+					if (!child) continue;
+					items.push({
+						id: child.id,
+						title: `    ↳ ${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
+						subtitle: todoSnippet(child),
+						status: todoSidebarChildStatus(getTodoStatus(child), groupColour),
+					});
+				}
+			}
+			if (items.length >= maxVisible) break;
+		}
+		return items.slice(0, maxVisible);
+	};
+
+	const sections: Array<Record<string, unknown>> = [
+		{
+			kind: "summary",
+			title: "Overview",
+			items: [
+				{ label: "Open", value: String(openTodos.length) },
+				{ label: "Assigned", value: String(assignedTodos.length) },
+				{ label: "Closed", value: String(todos.length - openTodos.length) },
+				{ label: "Filter", value: search.trim() || "none" },
+			],
+		},
+	];
+
+	if (search.trim()) {
+		sections.push({
+			kind: "list",
+			id: "todo-search-results",
+			label: "Filtered todos",
+			items: buildListItems(todos),
+			selected_id: detailTodo?.id,
+		});
+	} else {
+		sections.push({
+			kind: "list",
+			id: "todo-tree-list",
+			label: expanded ? "Todo tree" : "Recent todo tree",
+			items: buildTreeItems(),
+			selected_id: detailTodo?.id,
+		});
+	}
+
+	sections.push({
+		kind: "detail",
+		id: "todo-selected-detail",
+		title: detailTodo ? (expanded ? "Selected todo details" : "Selected todo") : "No todo selected",
+		lines: detailTodo
+			? buildTodoSidebarDetailLines(detailTodo, currentSessionId, expanded ? 12 : 5)
+			: ["No open todo selected."],
+	});
+
+	sections.push({
+		kind: "actions",
+		buttons: [
+			{ id: "enter", label: "Enter: actions" },
+			{ id: "work", label: "Ctrl+Shift+W: work" },
+			{ id: "refine", label: "Ctrl+Shift+R: refine" },
+		],
+	});
+
+	return {
+		id: "pi-todos-sidebar",
+		title: "Todos",
+		sections,
+	};
+}
+
+function stripAtPrefix(value: string): string {
+	return value.startsWith("@") ? value.slice(1) : value;
+}
+
+function expandHome(value: string): string {
+	if (value === "~") return os.homedir();
+	if (value.startsWith("~/")) return path.join(os.homedir(), value.slice(2));
+	return value;
+}
+
+function defaultMpmuxSocketPath(): string {
+	const explicit = process.env[MPMUX_SOCKET_ENV];
+	if (explicit && explicit.trim().length > 0) return expandHome(stripAtPrefix(explicit.trim()));
+
+	const runtimeDir = process.env.XDG_RUNTIME_DIR;
+	if (runtimeDir && runtimeDir.trim().length > 0) {
+		return path.join(runtimeDir, MPMUX_DEFAULT_SOCKET_NAME);
+	}
+
+	const uid = typeof process.getuid === "function" ? process.getuid() : undefined;
+	if (uid !== undefined) {
+		const runUser = path.join("/run/user", String(uid));
+		if (existsSync(runUser)) {
+			return path.join(runUser, MPMUX_DEFAULT_SOCKET_NAME);
+		}
+		return path.join("/tmp", `mpmux-${uid}`, MPMUX_DEFAULT_SOCKET_NAME);
+	}
+
+	return path.join(os.tmpdir(), MPMUX_DEFAULT_SOCKET_NAME);
+}
+
+function createMpmuxHostClientId(): string {
+	return `pi-todos-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+async function sendMpmuxHostRequest(
+	socketPath: string,
+	command: string,
+	fields: Record<string, unknown>,
+	timeoutMs = MPMUX_HOST_TIMEOUT_MS,
+): Promise<unknown> {
+	const request = JSON.stringify({ id: `pi-todos-${Date.now()}`, command, ...fields }) + "\n";
+
+	return await new Promise<unknown>((resolve, reject) => {
+		const client = net.createConnection(socketPath);
+		let settled = false;
+		let buffer = "";
+
+		const finish = (fn: () => void) => {
+			if (settled) return;
+			settled = true;
+			client.removeAllListeners();
+			client.destroy();
+			fn();
+		};
+
+		client.setTimeout(timeoutMs, () => {
+			finish(() => reject(new Error(`Timed out waiting for mpmux host response from ${socketPath}`)));
+		});
+
+		client.on("connect", () => {
+			client.write(request);
+		});
+
+		client.on("data", (chunk) => {
+			buffer += chunk.toString("utf8");
+			const newlineIndex = buffer.indexOf("\n");
+			if (newlineIndex === -1) return;
+			const line = buffer.slice(0, newlineIndex).trim();
+			if (!line) {
+				finish(() => reject(new Error("Received an empty response line from the mpmux host socket.")));
+				return;
+			}
+			try {
+				const parsed = JSON.parse(line) as Record<string, unknown>;
+				if (parsed.status === "error") {
+					const message = typeof parsed.message === "string" ? parsed.message : `Host command failed: ${command}`;
+					finish(() => reject(new Error(message)));
+					return;
+				}
+				if (parsed.status === "ok") {
+					finish(() => resolve(parsed.data));
+					return;
+				}
+				finish(() => resolve(parsed));
+			} catch (error) {
+				finish(() => reject(error instanceof Error ? error : new Error(String(error))));
+			}
+		});
+
+		client.on("error", (error) => {
+			finish(() => reject(error));
+		});
+
+		client.on("end", () => {
+			if (settled) return;
+			finish(() => reject(new Error("Connection closed before a host response was received.")));
+		});
+	});
+}
+
+async function ensureMpmuxHostAttached(state: MpmuxHostSidebarState): Promise<void> {
+	if (state.attached) return;
+	await sendMpmuxHostRequest(state.socketPath, "attach", {
+		client_id: state.clientId,
+		target_client_id: state.clientId,
+		name: "Pi todos sidebar",
+		role: "controller",
+	});
+	state.attached = true;
+}
+
+async function withMpmuxHostControl<T>(
+	state: MpmuxHostSidebarState,
+	fn: () => Promise<T>,
+): Promise<T> {
+	await ensureMpmuxHostAttached(state);
+	await sendMpmuxHostRequest(state.socketPath, "acquire-control", {
+		client_id: state.clientId,
+		target_client_id: state.clientId,
+	});
+	try {
+		return await fn();
+	} finally {
+		await sendMpmuxHostRequest(state.socketPath, "release-control", {
+			client_id: state.clientId,
+			target_client_id: state.clientId,
+		}).catch(() => undefined);
+	}
+}
+
+async function showMpmuxTodoSidebar(
+	state: MpmuxHostSidebarState,
+	sidebar: ReturnType<typeof buildTodoSidebarSurface>,
+): Promise<void> {
+	await withMpmuxHostControl(state, async () => {
+		await sendMpmuxHostRequest(state.socketPath, "show-custom-sidebar", {
+			client_id: state.clientId,
+			sidebar,
+		});
+	});
+}
+
+async function clearMpmuxTodoSidebar(state: MpmuxHostSidebarState): Promise<void> {
+	await withMpmuxHostControl(state, async () => {
+		await sendMpmuxHostRequest(state.socketPath, "clear-custom-sidebar", {
+			client_id: state.clientId,
+		});
+	});
+}
+
+async function showMpmuxTodoDialog(
+	state: MpmuxHostSidebarState,
+	dialog: Record<string, unknown>,
+): Promise<void> {
+	await withMpmuxHostControl(state, async () => {
+		await sendMpmuxHostRequest(state.socketPath, "show-custom-dialog", {
+			client_id: state.clientId,
+			dialog,
+		});
+	});
+}
+
+async function clearMpmuxTodoDialog(state: MpmuxHostSidebarState): Promise<void> {
+	await withMpmuxHostControl(state, async () => {
+		await sendMpmuxHostRequest(state.socketPath, "clear-custom-dialog", {
+			client_id: state.clientId,
+		});
+	});
+}
+
+async function subscribeMpmuxTodoHostEvents(state: MpmuxHostSidebarState): Promise<void> {
+	await ensureMpmuxHostAttached(state);
+	await sendMpmuxHostRequest(state.socketPath, "subscribe", {
+		client_id: state.clientId,
+		events: ["ui-state-changed", "custom-dialog-state-changed", "custom-sidebar-state-changed"],
+	});
+}
+
+async function pollMpmuxTodoHostEvents(state: MpmuxHostSidebarState): Promise<MpmuxHostPollEventsResponse> {
+	await ensureMpmuxHostAttached(state);
+	return (await sendMpmuxHostRequest(state.socketPath, "poll-events", {
+		client_id: state.clientId,
+		max_events: 8,
+	})) as MpmuxHostPollEventsResponse;
+}
+
+function sleep(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function showMpmuxTodoUiState(state: MpmuxHostSidebarState): Promise<MpmuxUiState> {
+	await ensureMpmuxHostAttached(state);
+	return (await sendMpmuxHostRequest(state.socketPath, "show-ui-state", {
+		client_id: state.clientId,
+	})) as MpmuxUiState;
+}
+
+function isMpmuxWaitTimeout(error: unknown): boolean {
+	return error instanceof Error && /timed out waiting for mpmux host response/i.test(error.message);
+}
+
+function isMpmuxOverlayAlreadyActiveError(error: unknown): boolean {
+	return error instanceof Error && /another overlay is already active/i.test(error.message);
+}
+
+function useExpandedTodoSidebarLayout(uiState: MpmuxUiState | null): boolean {
+	if (!uiState) return false;
+	if (uiState.message_sidebar.maximize_mode) return true;
+	return (uiState.message_sidebar.visible_width_px ?? 0) >= 700;
+}
+
+function buildTodoSidebarDialogSurface(todo: TodoRecord, currentSessionId?: string) {
+	const assignedToCurrentSession = todo.assigned_to_session === currentSessionId;
+	const claimLabel = todo.assigned_to_session
+		? assignedToCurrentSession
+			? "Release"
+			: "Force Claim"
+		: "Claim";
+	const closeLabel = isTodoClosed(getTodoStatus(todo)) ? "Reopen ticket" : "Close ticket";
+	return {
+		id: `todo-actions-${todo.id}`,
+		title: `${formatTodoId(todo.id)} ${todo.title || "(untitled)"}`,
+		subtitle: "Choose an action",
+		width: "wide",
+		dismissable: true,
+		submit_on_enter: true,
+		sections: [
+			{
+				kind: "detail",
+				id: "todo-details",
+				title: "Todo details",
+				lines: buildTodoSidebarDetailLines(todo, currentSessionId, 12),
+			},
+		],
+		footer: {
+			primary: { id: "work", label: "Work on", style: "primary" },
+			secondary: [
+				{ id: "refine", label: "Refine" },
+				{ id: "claim-toggle", label: claimLabel },
+				{ id: "status-toggle", label: closeLabel },
+			],
+		},
+	};
+}
+
+async function cleanupMpmuxHostSidebarState(state: MpmuxHostSidebarState): Promise<void> {
+	if (!state.attached) return;
+	await sendMpmuxHostRequest(state.socketPath, "detach", {
+		client_id: state.clientId,
+		target_client_id: state.clientId,
+	}).catch(() => undefined);
+	state.attached = false;
 }
 
 async function ensureTodoExists(filePath: string, id: string): Promise<TodoRecord | null> {
@@ -1282,6 +2288,7 @@ async function ensureTodoExists(filePath: string, id: string): Promise<TodoRecor
 async function appendTodoBody(filePath: string, todo: TodoRecord, text: string): Promise<TodoRecord> {
 	const spacer = todo.body.trim().length ? "\n\n" : "";
 	todo.body = `${todo.body.replace(/\s+$/, "")}${spacer}${text.trim()}\n`;
+	markTodoUpdated(todo);
 	await writeTodoFile(filePath, todo);
 	return todo;
 }
@@ -1306,6 +2313,7 @@ async function updateTodoStatus(
 		const existing = await ensureTodoExists(filePath, normalizedId);
 		if (!existing) return { error: `Todo ${displayTodoId(id)} not found` } as const;
 		existing.status = status;
+		markTodoUpdated(existing);
 		clearAssignmentIfClosed(existing);
 		await writeTodoFile(filePath, existing);
 		return existing;
@@ -1346,10 +2354,11 @@ async function claimTodoAssignment(
 				error: `Todo ${displayTodoId(id)} is already assigned to session ${assigned}. Use force to override.`,
 			} as const;
 		}
+		markTodoWorked(existing, sessionId);
 		if (assigned !== sessionId) {
 			existing.assigned_to_session = sessionId;
-			await writeTodoFile(filePath, existing);
 		}
+		await writeTodoFile(filePath, existing);
 		return existing;
 	});
 
@@ -1438,15 +2447,632 @@ export default function todosExtension(pi: ExtensionAPI) {
 	});
 
 	const todosDirLabel = getTodosDirLabel(process.cwd());
+	const hostSidebarClients = new Map<string, MpmuxHostSidebarState>();
+
+	function getHostSidebarState(socketPath = defaultMpmuxSocketPath()): MpmuxHostSidebarState {
+		let state = hostSidebarClients.get(socketPath);
+		if (!state) {
+			state = {
+				socketPath,
+				clientId: createMpmuxHostClientId(),
+				attached: false,
+			};
+			hostSidebarClients.set(socketPath, state);
+		}
+		return state;
+	}
+
+	pi.on("session_shutdown", async () => {
+		for (const state of hostSidebarClients.values()) {
+			await cleanupMpmuxHostSidebarState(state);
+		}
+		hostSidebarClients.clear();
+	});
+
+	function workPromptForTodo(todo: TodoFrontMatter): string {
+		return `work on todo ${formatTodoId(todo.id)} "${todo.title || "(untitled)"}"`;
+	}
+
+	function selectedTodoFromId(todos: TodoRecord[], selectedTodoId: string | null): TodoRecord | null {
+		if (selectedTodoId) {
+			const exact = todos.find((todo) => todo.id === normalizeTodoId(selectedTodoId));
+			if (exact) return exact;
+		}
+		return todos.find((todo) => !isTodoClosed(getTodoStatus(todo))) ?? todos[0] ?? null;
+	}
+
+	async function runTodoSidebarHostUi(args: string, ctx: ExtensionCommandContext): Promise<void> {
+		const trimmedArgs = (args ?? "").trim();
+		if (!ctx.hasUI) {
+			console.log("/todos-sidebar requires the Pi UI and an mpmux host session.");
+			return;
+		}
+
+		const todosDir = getTodosDir(ctx.cwd);
+		const state: MpmuxHostSidebarState = {
+			socketPath: defaultMpmuxSocketPath(),
+			clientId: createMpmuxHostClientId(),
+			attached: false,
+		};
+		const currentSessionId = ctx.sessionManager.getSessionId();
+		let uiState: MpmuxUiState | null = null;
+		const initialTodoId = trimmedArgs && !("error" in validateTodoId(trimmedArgs)) ? normalizeTodoId(trimmedArgs) : null;
+		const sidebarSearch = trimmedArgs && !initialTodoId ? trimmedArgs : "";
+		let selectedTodoId: string | null = initialTodoId;
+		const expandedRootIds = new Set<string>();
+		const collapsedRootIds = new Set<string>();
+		let lastSidebarInteractionNonce = 0;
+		let lastDialogActionNonce = 0;
+		let nextPrompt: string | null = null;
+		let keepRunning = true;
+		let sidebarDirty = false;
+		let todosWatcher: FSWatcher | null = null;
+
+		const refreshSidebar = async () => {
+			const todos = await listTodoRecords(todosDir);
+			const visibleTodos = sidebarSearch ? filterTodos(todos, sidebarSearch) as TodoRecord[] : todos;
+			const selectedTodo = selectedTodoFromId(visibleTodos, selectedTodoId);
+			selectedTodoId = selectedTodo?.id ?? null;
+			await showMpmuxTodoSidebar(
+				state,
+				buildTodoSidebarSurface(visibleTodos, selectedTodo, sidebarSearch, currentSessionId, {
+					expanded: useExpandedTodoSidebarLayout(uiState),
+					expandedRootIds,
+					collapsedRootIds,
+				}),
+			);
+		};
+
+		const toggleTodoTreeRoot = async (todoId: string, options: { collapseOnly?: boolean; expandOnly?: boolean } = {}): Promise<boolean> => {
+			const todos = await listTodoRecords(todosDir);
+			const visibleTodos = sidebarSearch ? filterTodos(todos, sidebarSearch) as TodoRecord[] : todos;
+			const index = buildTodoIndex(
+				visibleTodos.filter((todo) => !isTodoClosed(getTodoStatus(todo))),
+			);
+			const normalized = normalizeTodoId(todoId);
+			const rootId = todoIndexRootId(index, normalized);
+			if (!rootId) return false;
+			const rootNode = index.graph.nodes[rootId];
+			if (!rootNode || rootNode.child_ids.length === 0) return false;
+			const selectedRootId = selectedTodoId ? todoIndexRootId(index, selectedTodoId) : null;
+			const effectivelyExpanded = !collapsedRootIds.has(rootId)
+				&& (expandedRootIds.has(rootId) || selectedRootId === rootId || useExpandedTodoSidebarLayout(uiState));
+			if (effectivelyExpanded) {
+				if (options.expandOnly) return false;
+				expandedRootIds.delete(rootId);
+				collapsedRootIds.add(rootId);
+			} else {
+				if (options.collapseOnly) return false;
+				collapsedRootIds.delete(rootId);
+				expandedRootIds.add(rootId);
+			}
+			selectedTodoId = rootId;
+			await refreshSidebar();
+			return true;
+		};
+
+		const openSelectedTodoDialog = async (todoId: string) => {
+			const todos = await listTodoRecords(todosDir);
+			const todo = todos.find((item) => item.id === normalizeTodoId(todoId));
+			if (!todo) {
+				ctx.ui.notify(`Todo ${displayTodoId(todoId)} not found`, "error");
+				await refreshSidebar();
+				return;
+			}
+			selectedTodoId = todo.id;
+			if (uiState?.custom_dialog?.open) {
+				return;
+			}
+			try {
+				await showMpmuxTodoDialog(state, buildTodoSidebarDialogSurface(todo, currentSessionId));
+			} catch (error) {
+				if (isMpmuxOverlayAlreadyActiveError(error)) {
+					uiState = await showMpmuxTodoUiState(state).catch(() => uiState);
+					return;
+				}
+				throw error;
+			}
+		};
+
+		const applyDialogAction = async (actionId: string) => {
+			if (!selectedTodoId) return;
+			const todo = (await listTodoRecords(todosDir)).find((item) => item.id === selectedTodoId);
+			if (!todo) {
+				ctx.ui.notify(`Todo ${displayTodoId(selectedTodoId)} not found`, "error");
+				await refreshSidebar();
+				return;
+			}
+
+			switch (actionId) {
+				case "work": {
+					nextPrompt = workPromptForTodo(todo);
+					keepRunning = false;
+					return;
+				}
+				case "refine": {
+					nextPrompt = buildRefinePrompt(todo.id, todo.title || "(untitled)");
+					keepRunning = false;
+					return;
+				}
+				case "claim-toggle": {
+					const result = !todo.assigned_to_session
+						? await claimTodoAssignment(todosDir, todo.id, ctx, false)
+						: todo.assigned_to_session === currentSessionId
+							? await releaseTodoAssignment(todosDir, todo.id, ctx, false)
+							: await claimTodoAssignment(todosDir, todo.id, ctx, true);
+					if ("error" in result) {
+						ctx.ui.notify(result.error, "error");
+					} else {
+						ctx.ui.notify(
+							todo.assigned_to_session === currentSessionId
+								? `Released ${formatTodoId(todo.id)}`
+								: `Claimed ${formatTodoId(todo.id)}`,
+							"info",
+						);
+					}
+					await refreshSidebar();
+					return;
+				}
+				case "status-toggle": {
+					const nextStatus = isTodoClosed(getTodoStatus(todo)) ? "open" : "closed";
+					const result = await updateTodoStatus(todosDir, todo.id, nextStatus, ctx);
+					if ("error" in result) {
+						ctx.ui.notify(result.error, "error");
+					} else {
+						ctx.ui.notify(
+							nextStatus === "closed"
+								? `Closed ${formatTodoId(todo.id)}`
+								: `Reopened ${formatTodoId(todo.id)}`,
+							"info",
+						);
+					}
+					await refreshSidebar();
+					return;
+				}
+			}
+		};
+
+		try {
+			await ensureTodosDir(todosDir);
+			todosWatcher = watch(todosDir, (eventType, filename) => {
+				if (eventType === "rename" || (typeof filename === "string" && filename.endsWith(".md"))) {
+					sidebarDirty = true;
+				}
+			});
+			await ensureMpmuxHostAttached(state);
+			await subscribeMpmuxTodoHostEvents(state);
+			uiState = await showMpmuxTodoUiState(state);
+			await refreshSidebar();
+
+			while (keepRunning) {
+				let response: MpmuxHostPollEventsResponse;
+				try {
+					response = await pollMpmuxTodoHostEvents(state);
+				} catch (error) {
+					if (isMpmuxWaitTimeout(error)) {
+						await sleep(250);
+						continue;
+					}
+					throw error;
+				}
+
+				if (response.events.length === 0) {
+					if (sidebarDirty) {
+						sidebarDirty = false;
+						await refreshSidebar();
+						continue;
+					}
+					// `wait-for-events` is the preferred shape, but this command runs inside Pi
+					// and must not leave a host-control bridge request blocked behind a long wait.
+					// Polling is local to the visible sidebar lifecycle and every poll returns
+					// immediately, keeping the shared host-control socket responsive.
+					await sleep(250);
+					continue;
+				}
+
+				for (const event of response.events) {
+					if (event.ui_state) {
+						const nextExpanded = useExpandedTodoSidebarLayout(event.ui_state);
+						const prevExpanded = useExpandedTodoSidebarLayout(uiState);
+						uiState = event.ui_state;
+						if (nextExpanded !== prevExpanded) {
+							await refreshSidebar();
+						}
+					}
+
+					if (event.custom_sidebar) {
+						if (!event.custom_sidebar.open) {
+							keepRunning = false;
+							break;
+						}
+						if (event.custom_sidebar.selected_item_id) {
+							// The host already moves the visible highlight locally for ArrowUp/ArrowDown.
+							// Do not echo every selection change back through show-custom-sidebar: doing so
+							// rebuilds the whole sidebar, resets scroll targets, and makes cursor navigation
+							// visibly jump. Keep only the logical selection here; refresh on structural
+							// changes such as expand/collapse, file updates, layout changes, and actions.
+							selectedTodoId = normalizeTodoId(event.custom_sidebar.selected_item_id);
+						}
+						const interaction = event.custom_sidebar.last_interaction;
+						if (
+							interaction &&
+							interaction.nonce > lastSidebarInteractionNonce
+						) {
+							lastSidebarInteractionNonce = interaction.nonce;
+							if (interaction.kind === "item-invoked" && interaction.item_id) {
+								const source = interaction.source ?? "keyboard";
+								if (source === "pointer") {
+									await toggleTodoTreeRoot(interaction.item_id);
+									continue;
+								}
+								if (source === "arrow-left") {
+									await toggleTodoTreeRoot(interaction.item_id, { collapseOnly: true });
+									continue;
+								}
+								if (source === "arrow-right") {
+									await toggleTodoTreeRoot(interaction.item_id, { expandOnly: true });
+									continue;
+								}
+								await openSelectedTodoDialog(interaction.item_id);
+							}
+						}
+					}
+
+					if (event.custom_dialog?.last_action) {
+						const action = event.custom_dialog.last_action;
+						if (action.nonce > lastDialogActionNonce) {
+							lastDialogActionNonce = action.nonce;
+							await applyDialogAction(action.result.action_id);
+						}
+					}
+				}
+			}
+		} catch (error) {
+			ctx.ui.notify(
+				`mpmux todo sidebar unavailable: ${error instanceof Error ? error.message : String(error)}`,
+				"error",
+			);
+		} finally {
+			todosWatcher?.close();
+			await clearMpmuxTodoDialog(state).catch(() => undefined);
+			await clearMpmuxTodoSidebar(state).catch(() => undefined);
+			await cleanupMpmuxHostSidebarState(state).catch(() => undefined);
+		}
+
+		if (nextPrompt) {
+			ctx.ui.setEditorText(nextPrompt);
+		}
+	}
+
+	async function runTodoManager(
+		args: string,
+		ctx: ExtensionCommandContext,
+		options: { syncHostSidebar: boolean },
+	) {
+		const todosDir = getTodosDir(ctx.cwd);
+		let todoRecords = await listTodoRecords(todosDir);
+		const currentSessionId = ctx.sessionManager.getSessionId();
+		const searchTerm = (args ?? "").trim();
+
+		if (!ctx.hasUI) {
+			console.log(formatTodoList(todoRecords));
+			return;
+		}
+
+		const recordCache = new Map(todoRecords.map((todo) => [todo.id, todo] as const));
+		const hostSidebarState = options.syncHostSidebar ? getHostSidebarState() : null;
+		let hostSidebarUnavailable = false;
+		let keepHostSidebarOpen = false;
+		let nextPrompt: string | null = null;
+		let rootTui: TUI | null = null;
+
+		const syncHostSidebar = async (
+			selectedTodo: TodoFrontMatter | null,
+			state: { search: string; filteredTodos: TodoFrontMatter[] },
+		) => {
+			if (!hostSidebarState || hostSidebarUnavailable) return;
+			try {
+				const selectedRecord = selectedTodo ? recordCache.get(selectedTodo.id) ?? null : null;
+				const filteredRecords = state.filteredTodos
+					.map((todo) => recordCache.get(todo.id))
+					.filter((todo): todo is TodoRecord => Boolean(todo));
+				await showMpmuxTodoSidebar(
+					hostSidebarState,
+					buildTodoSidebarSurface(filteredRecords, selectedRecord, state.search, currentSessionId),
+				);
+			} catch (error) {
+				hostSidebarUnavailable = true;
+				ctx.ui.notify(
+					`mpmux sidebar unavailable: ${error instanceof Error ? error.message : String(error)}`,
+					"warning",
+				);
+			}
+		};
+
+		await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
+			rootTui = tui;
+			let selector: TodoSelectorComponent | null = null;
+			let actionMenu: TodoActionMenuComponent | null = null;
+			let deleteConfirm: TodoDeleteConfirmComponent | null = null;
+			let activeComponent:
+				| {
+						render: (width: number) => string[];
+						invalidate: () => void;
+						handleInput?: (data: string) => void;
+						focused?: boolean;
+				  }
+				| null = null;
+			let wrapperFocused = false;
+
+			const setActiveComponent = (
+				component:
+					| {
+							render: (width: number) => string[];
+							invalidate: () => void;
+							handleInput?: (data: string) => void;
+							focused?: boolean;
+					  }
+					| null,
+			) => {
+				if (activeComponent && "focused" in activeComponent) {
+					activeComponent.focused = false;
+				}
+				activeComponent = component;
+				if (activeComponent && "focused" in activeComponent) {
+					activeComponent.focused = wrapperFocused;
+				}
+				tui.requestRender();
+			};
+
+			const copyTodoPathToClipboard = (todoId: string) => {
+				const filePath = getTodoPath(todosDir, todoId);
+				const absolutePath = path.resolve(filePath);
+				try {
+					copyToClipboard(absolutePath);
+					ctx.ui.notify(`Copied ${absolutePath} to clipboard`, "info");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(message, "error");
+				}
+			};
+
+			const copyTodoTextToClipboard = (record: TodoRecord) => {
+				const title = record.title || "(untitled)";
+				const body = record.body?.trim() || "";
+				const text = body ? `# ${title}\n\n${body}` : `# ${title}`;
+				try {
+					copyToClipboard(text);
+					ctx.ui.notify("Copied todo text to clipboard", "info");
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					ctx.ui.notify(message, "error");
+				}
+			};
+
+			const resolveTodoRecord = async (todo: TodoFrontMatter): Promise<TodoRecord | null> => {
+				const cached = recordCache.get(todo.id);
+				if (cached) return cached;
+				const filePath = getTodoPath(todosDir, todo.id);
+				const record = await ensureTodoExists(filePath, todo.id);
+				if (!record) {
+					ctx.ui.notify(`Todo ${formatTodoId(todo.id)} not found`, "error");
+					return null;
+				}
+				recordCache.set(record.id, record);
+				return record;
+			};
+
+			const refreshTodoRecords = async () => {
+				todoRecords = await listTodoRecords(todosDir);
+				recordCache.clear();
+				for (const todo of todoRecords) recordCache.set(todo.id, todo);
+				selector?.setTodos(todoRecords);
+			};
+
+			const openTodoOverlay = async (record: TodoRecord): Promise<TodoOverlayAction> => {
+				const action = await ctx.ui.custom<TodoOverlayAction>(
+					(overlayTui, overlayTheme, overlayKeybindings, overlayDone) =>
+						new TodoDetailOverlayComponent(
+							overlayTui,
+							overlayTheme,
+							overlayKeybindings,
+							record,
+							overlayDone,
+						),
+					{
+						overlay: true,
+						overlayOptions: { width: "80%", maxHeight: "80%", anchor: "center" },
+					},
+				);
+
+				return action ?? "back";
+			};
+
+			const applyTodoAction = async (
+				record: TodoRecord,
+				action: TodoMenuAction,
+			): Promise<"stay" | "exit"> => {
+				if (action === "refine") {
+					keepHostSidebarOpen = true;
+					nextPrompt = buildRefinePrompt(record.id, record.title || "(untitled)");
+					done();
+					return "exit";
+				}
+				if (action === "work") {
+					keepHostSidebarOpen = true;
+					nextPrompt = `work on todo ${formatTodoId(record.id)} "${record.title || "(untitled)"}"`;
+					done();
+					return "exit";
+				}
+				if (action === "view") {
+					return "stay";
+				}
+				if (action === "copyPath") {
+					copyTodoPathToClipboard(record.id);
+					return "stay";
+				}
+				if (action === "copyText") {
+					copyTodoTextToClipboard(record);
+					return "stay";
+				}
+
+				if (action === "release") {
+					const result = await releaseTodoAssignment(todosDir, record.id, ctx, true);
+					if ("error" in result) {
+						ctx.ui.notify(result.error, "error");
+						return "stay";
+					}
+					await refreshTodoRecords();
+					ctx.ui.notify(`Released todo ${formatTodoId(record.id)}`, "info");
+					return "stay";
+				}
+
+				if (action === "delete") {
+					const result = await deleteTodo(todosDir, record.id, ctx);
+					if ("error" in result) {
+						ctx.ui.notify(result.error, "error");
+						return "stay";
+					}
+					await refreshTodoRecords();
+					ctx.ui.notify(`Deleted todo ${formatTodoId(record.id)}`, "info");
+					return "stay";
+				}
+
+				const nextStatus = action === "close" ? "closed" : "open";
+				const result = await updateTodoStatus(todosDir, record.id, nextStatus, ctx);
+				if ("error" in result) {
+					ctx.ui.notify(result.error, "error");
+					return "stay";
+				}
+
+				await refreshTodoRecords();
+				ctx.ui.notify(
+					`${action === "close" ? "Closed" : "Reopened"} todo ${formatTodoId(record.id)}`,
+					"info",
+				);
+				return "stay";
+			};
+
+			const handleActionSelection = async (record: TodoRecord, action: TodoMenuAction) => {
+				if (action === "view") {
+					const overlayAction = await openTodoOverlay(record);
+					if (overlayAction === "work") {
+						await applyTodoAction(record, "work");
+						return;
+					}
+					if (actionMenu) {
+						setActiveComponent(actionMenu);
+					}
+					return;
+				}
+
+				if (action === "delete") {
+					const message = `Delete todo ${formatTodoId(record.id)}? This cannot be undone.`;
+					deleteConfirm = new TodoDeleteConfirmComponent(theme, message, (confirmed) => {
+						if (!confirmed) {
+							setActiveComponent(actionMenu);
+							return;
+						}
+						void (async () => {
+							await applyTodoAction(record, "delete");
+							setActiveComponent(selector);
+						})();
+					});
+					setActiveComponent(deleteConfirm);
+					return;
+				}
+
+				const result = await applyTodoAction(record, action);
+				if (result === "stay") {
+					setActiveComponent(selector);
+				}
+			};
+
+			const showActionMenu = async (todo: TodoFrontMatter | TodoRecord) => {
+				const record = "body" in todo ? todo : await resolveTodoRecord(todo);
+				if (!record) return;
+				actionMenu = new TodoActionMenuComponent(
+					theme,
+					record,
+					(action) => {
+						void handleActionSelection(record, action);
+					},
+					() => {
+						setActiveComponent(selector);
+					},
+				);
+				setActiveComponent(actionMenu);
+			};
+
+			selector = new TodoSelectorComponent(
+				tui,
+				theme,
+				keybindings,
+				todoRecords,
+				(todo) => {
+					void showActionMenu(todo);
+				},
+				() => done(),
+				searchTerm || undefined,
+				currentSessionId,
+				(todo, action) => {
+					keepHostSidebarOpen = options.syncHostSidebar;
+					nextPrompt =
+						action === "refine"
+							? buildRefinePrompt(todo.id, todo.title || "(untitled)")
+							: `work on todo ${formatTodoId(todo.id)} "${todo.title || "(untitled)"}"`;
+					done();
+				},
+				(todo, state) => {
+					void syncHostSidebar(todo, state);
+				},
+			);
+
+			setActiveComponent(selector);
+
+			const rootComponent = {
+				get focused() {
+					return wrapperFocused;
+				},
+				set focused(value: boolean) {
+					wrapperFocused = value;
+					if (activeComponent && "focused" in activeComponent) {
+						activeComponent.focused = value;
+					}
+				},
+				render(width: number) {
+					return activeComponent ? activeComponent.render(width) : [];
+				},
+				invalidate() {
+					activeComponent?.invalidate();
+				},
+				handleInput(data: string) {
+					activeComponent?.handleInput?.(data);
+				},
+			};
+
+			return rootComponent;
+		});
+
+		if (nextPrompt) {
+			ctx.ui.setEditorText(nextPrompt);
+			rootTui?.requestRender();
+		}
+
+		if (hostSidebarState && !keepHostSidebarOpen && !hostSidebarUnavailable) {
+			await clearMpmuxTodoSidebar(hostSidebarState).catch(() => undefined);
+		}
+	}
 
 	pi.registerTool({
 		name: "todo",
 		label: "Todo",
 		description:
-			`Manage file-based todos in ${todosDirLabel} (list, list-all, get, create, update, append, delete, claim, release). ` +
-			"Title is the short summary; body is long-form markdown notes (update replaces, append adds). " +
+			`Manage file-based todos in ${todosDirLabel} (list, list-all, get, create, update, append, delete, claim, release, refresh-index). ` +
+			"Title is the short summary; body is long-form markdown notes (update replaces, append adds); group_colour is an optional #rrggbb sidebar accent for parent/group todos. " +
 			"Todo ids are shown as TODO-<hex>; id parameters accept TODO-<hex> or the raw hex filename. " +
-			"Claim tasks before working on them to avoid conflicts, and close them when complete.", 
+			"Claim tasks before working on them to avoid conflicts, and close them when complete. " +
+			"When creating or updating related work, mention TODO-<hex> references in the body using headings like Parent, Children, Depends on, Blocks, Related, Duplicate of, or Subtasks so in-memory overview/navigation can build relationships; refresh-index only exports a generated debug/index artifact.",
 		parameters: TodoParams,
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1514,12 +3140,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 					await ensureTodosDir(todosDir);
 					const id = await generateTodoId(todosDir);
 					const filePath = getTodoPath(todosDir, id);
+					const now = new Date().toISOString();
 					const todo: TodoRecord = {
 						id,
 						title: params.title,
 						tags: params.tags ?? [],
 						status: params.status ?? "open",
-						created_at: new Date().toISOString(),
+						created_at: now,
+						updated_at: now,
+						group_colour: normalizeTodoGroupColour(params.group_colour),
 						body: params.body ?? "",
 					};
 
@@ -1569,11 +3198,29 @@ export default function todosExtension(pi: ExtensionAPI) {
 						if (!existing) return { error: `Todo ${displayId} not found` } as const;
 
 						existing.id = normalizedId;
-						if (params.title !== undefined) existing.title = params.title;
-						if (params.status !== undefined) existing.status = params.status;
-						if (params.tags !== undefined) existing.tags = params.tags;
-						if (params.body !== undefined) existing.body = params.body;
+						let contentChanged = false;
+						if (params.title !== undefined) {
+							existing.title = params.title;
+							contentChanged = true;
+						}
+						if (params.status !== undefined) {
+							existing.status = params.status;
+							contentChanged = true;
+						}
+						if (params.tags !== undefined) {
+							existing.tags = params.tags;
+							contentChanged = true;
+						}
+						if (params.body !== undefined) {
+							existing.body = params.body;
+							contentChanged = true;
+						}
+						if (params.group_colour !== undefined) {
+							existing.group_colour = normalizeTodoGroupColour(params.group_colour);
+							contentChanged = true;
+						}
 						if (!existing.created_at) existing.created_at = new Date().toISOString();
+						if (contentChanged) markTodoUpdated(existing);
 						clearAssignmentIfClosed(existing);
 
 						await writeTodoFile(filePath, existing);
@@ -1693,6 +3340,20 @@ export default function todosExtension(pi: ExtensionAPI) {
 					};
 				}
 
+				case "refresh-index": {
+					const index = await refreshTodoIndex(todosDir);
+					const indexPath = getTodoIndexPath(todosDir);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Refreshed ${indexPath} (${index.summary.open} open, ${index.summary.closed} closed, ${index.graph.edges.length} relationship edges).`,
+							},
+						],
+						details: { action: "refresh-index", index },
+					};
+				}
+
 				case "delete": {
 					if (!params.id) {
 						return {
@@ -1765,7 +3426,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 				return new Text(text, 0, 0);
 			}
 
-			if (!details.todo) {
+			if (details.action === "refresh-index") {
+				const text =
+					theme.fg("success", "✓ Refreshed todo index") +
+					"\n" +
+					theme.fg("muted", `${details.index.summary.open} open • ${details.index.summary.closed} closed • ${details.index.graph.edges.length} edges`);
+				return new Text(text, 0, 0);
+			}
+
+			if (!("todo" in details)) {
 				const text = result.content[0];
 				return new Text(text?.type === "text" ? text.text : "", 0, 0);
 			}
@@ -1800,282 +3469,48 @@ export default function todosExtension(pi: ExtensionAPI) {
 	pi.registerCommand("todos", {
 		description: "List todos from .pi/todos",
 		handler: async (args, ctx) => {
-			const todosDir = getTodosDir(ctx.cwd);
-			const todos = await listTodos(todosDir);
-			const currentSessionId = ctx.sessionManager.getSessionId();
-			const searchTerm = (args ?? "").trim();
+			await runTodoManager(args, ctx, { syncHostSidebar: false });
+		},
+	});
 
-			if (!ctx.hasUI) {
-				const text = formatTodoList(todos);
-				console.log(text);
+	pi.registerCommand("todos-index", {
+		description: "Export the optional generated .pi/todos/index.json snapshot",
+		handler: async (_args, ctx) => {
+			const todosDir = getTodosDir(ctx.cwd);
+			try {
+				const index = await refreshTodoIndex(todosDir);
+				ctx.ui.notify(
+					`Refreshed todo index (${index.summary.open} open, ${index.summary.closed} closed, ${index.graph.edges.length} edges).`,
+					"info",
+				);
+			} catch (error) {
+				ctx.ui.notify(
+					`Failed to refresh todo index: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.registerCommand("todos-sidebar", {
+		description: "Open the standalone mpmux-hosted todo sidebar UI",
+		handler: async (args, ctx) => {
+			if ((args ?? "").trim() === "--clear") {
+				const state = getHostSidebarState();
+				try {
+					await clearMpmuxTodoDialog(state).catch(() => undefined);
+					await clearMpmuxTodoSidebar(state);
+					ctx.ui.notify("Cleared the mpmux todo sidebar.", "info");
+				} catch (error) {
+					ctx.ui.notify(
+						`Failed to clear the mpmux todo sidebar: ${error instanceof Error ? error.message : String(error)}`,
+						"error",
+					);
+				}
 				return;
 			}
 
-			let nextPrompt: string | null = null;
-			let rootTui: TUI | null = null;
-			await ctx.ui.custom<void>((tui, theme, keybindings, done) => {
-				rootTui = tui;
-				let selector: TodoSelectorComponent | null = null;
-				let actionMenu: TodoActionMenuComponent | null = null;
-				let deleteConfirm: TodoDeleteConfirmComponent | null = null;
-				let activeComponent:
-					| {
-							render: (width: number) => string[];
-							invalidate: () => void;
-							handleInput?: (data: string) => void;
-							focused?: boolean;
-						}
-					| null = null;
-				let wrapperFocused = false;
-
-				const setActiveComponent = (
-					component:
-						| {
-								render: (width: number) => string[];
-								invalidate: () => void;
-								handleInput?: (data: string) => void;
-								focused?: boolean;
-							}
-						| null,
-				) => {
-					if (activeComponent && "focused" in activeComponent) {
-						activeComponent.focused = false;
-					}
-					activeComponent = component;
-					if (activeComponent && "focused" in activeComponent) {
-						activeComponent.focused = wrapperFocused;
-					}
-					tui.requestRender();
-				};
-
-				const copyTodoPathToClipboard = (todoId: string) => {
-					const filePath = getTodoPath(todosDir, todoId);
-					const absolutePath = path.resolve(filePath);
-					try {
-						copyToClipboard(absolutePath);
-						ctx.ui.notify(`Copied ${absolutePath} to clipboard`, "info");
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						ctx.ui.notify(message, "error");
-					}
-				};
-
-				const copyTodoTextToClipboard = (record: TodoRecord) => {
-					const title = record.title || "(untitled)";
-					const body = record.body?.trim() || "";
-					const text = body ? `# ${title}\n\n${body}` : `# ${title}`;
-					try {
-						copyToClipboard(text);
-						ctx.ui.notify("Copied todo text to clipboard", "info");
-					} catch (error) {
-						const message = error instanceof Error ? error.message : String(error);
-						ctx.ui.notify(message, "error");
-					}
-				};
-
-				const resolveTodoRecord = async (todo: TodoFrontMatter): Promise<TodoRecord | null> => {
-					const filePath = getTodoPath(todosDir, todo.id);
-					const record = await ensureTodoExists(filePath, todo.id);
-					if (!record) {
-						ctx.ui.notify(`Todo ${formatTodoId(todo.id)} not found`, "error");
-						return null;
-					}
-					return record;
-				};
-
-				const openTodoOverlay = async (record: TodoRecord): Promise<TodoOverlayAction> => {
-					const action = await ctx.ui.custom<TodoOverlayAction>(
-						(overlayTui, overlayTheme, overlayKeybindings, overlayDone) =>
-							new TodoDetailOverlayComponent(
-								overlayTui,
-								overlayTheme,
-								overlayKeybindings,
-								record,
-								overlayDone,
-							),
-						{
-							overlay: true,
-							overlayOptions: { width: "80%", maxHeight: "80%", anchor: "center" },
-						},
-					);
-
-					return action ?? "back";
-				};
-
-				const applyTodoAction = async (
-					record: TodoRecord,
-					action: TodoMenuAction,
-				): Promise<"stay" | "exit"> => {
-					if (action === "refine") {
-						const title = record.title || "(untitled)";
-						nextPrompt = buildRefinePrompt(record.id, title);
-						done();
-						return "exit";
-					}
-					if (action === "work") {
-						const title = record.title || "(untitled)";
-						nextPrompt = `work on todo ${formatTodoId(record.id)} "${title}"`;
-						done();
-						return "exit";
-					}
-					if (action === "view") {
-						return "stay";
-					}
-					if (action === "copyPath") {
-						copyTodoPathToClipboard(record.id);
-						return "stay";
-					}
-					if (action === "copyText") {
-						copyTodoTextToClipboard(record);
-						return "stay";
-					}
-
-					if (action === "release") {
-						const result = await releaseTodoAssignment(todosDir, record.id, ctx, true);
-						if ("error" in result) {
-							ctx.ui.notify(result.error, "error");
-							return "stay";
-						}
-						const updatedTodos = await listTodos(todosDir);
-						selector?.setTodos(updatedTodos);
-						ctx.ui.notify(`Released todo ${formatTodoId(record.id)}`, "info");
-						return "stay";
-					}
-
-					if (action === "delete") {
-						const result = await deleteTodo(todosDir, record.id, ctx);
-						if ("error" in result) {
-							ctx.ui.notify(result.error, "error");
-							return "stay";
-						}
-						const updatedTodos = await listTodos(todosDir);
-						selector?.setTodos(updatedTodos);
-						ctx.ui.notify(`Deleted todo ${formatTodoId(record.id)}`, "info");
-						return "stay";
-					}
-
-					const nextStatus = action === "close" ? "closed" : "open";
-					const result = await updateTodoStatus(todosDir, record.id, nextStatus, ctx);
-					if ("error" in result) {
-						ctx.ui.notify(result.error, "error");
-						return "stay";
-					}
-
-					const updatedTodos = await listTodos(todosDir);
-					selector?.setTodos(updatedTodos);
-					ctx.ui.notify(
-						`${action === "close" ? "Closed" : "Reopened"} todo ${formatTodoId(record.id)}`,
-						"info",
-					);
-					return "stay";
-				};
-
-				const handleActionSelection = async (record: TodoRecord, action: TodoMenuAction) => {
-					if (action === "view") {
-						const overlayAction = await openTodoOverlay(record);
-						if (overlayAction === "work") {
-							await applyTodoAction(record, "work");
-							return;
-						}
-						if (actionMenu) {
-							setActiveComponent(actionMenu);
-						}
-						return;
-					}
-
-					if (action === "delete") {
-						const message = `Delete todo ${formatTodoId(record.id)}? This cannot be undone.`;
-						deleteConfirm = new TodoDeleteConfirmComponent(theme, message, (confirmed) => {
-							if (!confirmed) {
-								setActiveComponent(actionMenu);
-								return;
-							}
-							void (async () => {
-								await applyTodoAction(record, "delete");
-								setActiveComponent(selector);
-							})();
-						});
-						setActiveComponent(deleteConfirm);
-						return;
-					}
-
-					const result = await applyTodoAction(record, action);
-					if (result === "stay") {
-						setActiveComponent(selector);
-					}
-				};
-
-				const showActionMenu = async (todo: TodoFrontMatter | TodoRecord) => {
-					const record = "body" in todo ? todo : await resolveTodoRecord(todo);
-					if (!record) return;
-					actionMenu = new TodoActionMenuComponent(
-						theme,
-						record,
-						(action) => {
-							void handleActionSelection(record, action);
-						},
-						() => {
-							setActiveComponent(selector);
-						},
-					);
-					setActiveComponent(actionMenu);
-				};
-
-				const handleSelect = async (todo: TodoFrontMatter) => {
-					await showActionMenu(todo);
-				};
-
-				selector = new TodoSelectorComponent(
-					tui,
-					theme,
-					keybindings,
-					todos,
-					(todo) => {
-						void handleSelect(todo);
-					},
-					() => done(),
-					searchTerm || undefined,
-					currentSessionId,
-					(todo, action) => {
-						const title = todo.title || "(untitled)";
-						nextPrompt =
-							action === "refine"
-								? buildRefinePrompt(todo.id, title)
-								: `work on todo ${formatTodoId(todo.id)} "${title}"`;
-						done();
-					},
-				);
-
-				setActiveComponent(selector);
-
-				const rootComponent = {
-					get focused() {
-						return wrapperFocused;
-					},
-					set focused(value: boolean) {
-						wrapperFocused = value;
-						if (activeComponent && "focused" in activeComponent) {
-							activeComponent.focused = value;
-						}
-					},
-					render(width: number) {
-						return activeComponent ? activeComponent.render(width) : [];
-					},
-					invalidate() {
-						activeComponent?.invalidate();
-					},
-					handleInput(data: string) {
-						activeComponent?.handleInput?.(data);
-					},
-				};
-
-				return rootComponent;
-			});
-
-			if (nextPrompt) {
-				ctx.ui.setEditorText(nextPrompt);
-				rootTui?.requestRender();
-			}
+			await runTodoSidebarHostUi(args, ctx);
 		},
 	});
 
