@@ -77,6 +77,11 @@ const LOCK_TTL_MS = 30 * 60 * 1000;
 const MPMUX_SOCKET_ENV = "MPMUX_SOCKET_PATH";
 const MPMUX_DEFAULT_SOCKET_NAME = "mpmux.sock";
 const MPMUX_HOST_TIMEOUT_MS = 5_000;
+const TODO_SIDEBAR_REFRESH_ITEM_ID = "__todo-sidebar-refresh";
+
+interface TodoSidebarFilterState {
+	query: string;
+}
 
 interface TodoFrontMatter {
 	id: string;
@@ -186,10 +191,11 @@ type MpmuxHostEventKind =
 
 type MpmuxCustomSidebarInteraction = {
 	nonce: number;
-	kind: "selection-changed" | "item-invoked";
+	kind: "selection-changed" | "item-invoked" | "filter-changed";
 	source?: string;
 	section_id?: string;
 	item_id?: string;
+	value?: string;
 };
 
 type MpmuxCustomSidebarState = {
@@ -199,6 +205,7 @@ type MpmuxCustomSidebarState = {
 	section_count: number;
 	rendered_text?: string;
 	selected_item_id?: string;
+	filter_query?: string;
 	last_interaction?: MpmuxCustomSidebarInteraction;
 };
 
@@ -398,6 +405,60 @@ function filterTodos(todos: TodoFrontMatter[], query: string): TodoFrontMatter[]
 			return a.score - b.score;
 		})
 		.map((match) => match.todo);
+}
+
+function todoSidebarFilterLabel(filter: TodoSidebarFilterState): string {
+	return filter.query.trim() || "none";
+}
+
+function splitTodoSidebarFilterQuery(query: string): { text: string; tags: string[] } {
+	const textTokens: string[] = [];
+	const tags: string[] = [];
+	for (const token of query.split(/\s+/).map((part) => part.trim()).filter(Boolean)) {
+		if (token.startsWith("#") && token.length > 1) {
+			tags.push(token.slice(1).toLowerCase());
+		} else {
+			textTokens.push(token);
+		}
+	}
+	return { text: textTokens.join(" "), tags };
+}
+
+function todoSidebarTextMatches(todo: TodoRecord, text: string): boolean {
+	const tokens = text
+		.toLowerCase()
+		.split(/\s+/)
+		.map((token) => token.trim())
+		.filter(Boolean);
+	if (tokens.length === 0) return true;
+
+	const searchable = `${formatTodoId(todo.id)} ${todo.id} ${todo.title}`.toLowerCase();
+	return tokens.every((token) => searchable.includes(token));
+}
+
+function todoMatchesSidebarFilter(todo: TodoRecord, filter: TodoSidebarFilterState): boolean {
+	const { text, tags } = splitTodoSidebarFilterQuery(filter.query);
+	if (tags.length && !tags.every((tag) => todo.tags.some((candidate) => candidate.toLowerCase() === tag))) {
+		return false;
+	}
+	return todoSidebarTextMatches(todo, text);
+}
+
+function filterTodosForSidebar(todos: TodoRecord[], filter: TodoSidebarFilterState): TodoRecord[] {
+	const matchingOpenTodos = todos.filter((todo) => !isTodoClosed(getTodoStatus(todo)) && todoMatchesSidebarFilter(todo, filter));
+	const matchingOpenIds = new Set(matchingOpenTodos.map((todo) => todo.id));
+	const index = buildTodoIndex(todos);
+	const visibleIds = new Set(matchingOpenIds);
+	for (const todo of matchingOpenTodos) {
+		for (const parentId of index.graph.nodes[todo.id]?.parent_ids ?? []) {
+			visibleIds.add(parentId);
+		}
+	}
+	return todos.filter((todo) => visibleIds.has(todo.id));
+}
+
+function isTodoSidebarActionItemId(itemId: string): boolean {
+	return itemId === TODO_SIDEBAR_REFRESH_ITEM_ID;
 }
 
 class TodoSelectorComponent extends Container implements Focusable {
@@ -1947,32 +2008,46 @@ function buildTodoSidebarSurface(
 	selectedTodo: TodoRecord | null,
 	search: string,
 	currentSessionId?: string,
-	options?: { expanded?: boolean; expandedRootIds?: ReadonlySet<string>; collapsedRootIds?: ReadonlySet<string> },
+	options?: {
+		expanded?: boolean;
+		expandedRootIds?: ReadonlySet<string>;
+		collapsedRootIds?: ReadonlySet<string>;
+		allTodos?: TodoRecord[];
+		filter?: TodoSidebarFilterState;
+	},
 ) {
 	const expanded = options?.expanded ?? false;
 	const expandedRootIds = options?.expandedRootIds;
 	const collapsedRootIds = options?.collapsedRootIds;
+	const filter = options?.filter ?? { query: search };
+	const summaryTodos = options?.allTodos ?? todos;
 	const openTodos = todos.filter((todo) => !isTodoClosed(getTodoStatus(todo)));
-	const assignedTodos = openTodos.filter((todo) => Boolean(todo.assigned_to_session));
-	const index = buildTodoIndex(openTodos);
-	const todoById = new Map(openTodos.map((todo) => [todo.id, todo] as const));
+	const assignedTodos = summaryTodos.filter((todo) => !isTodoClosed(getTodoStatus(todo)) && Boolean(todo.assigned_to_session));
+	const closedTodoCount = summaryTodos.filter((todo) => isTodoClosed(getTodoStatus(todo))).length;
+	const index = buildTodoIndex(todos);
+	const todoById = new Map(todos.map((todo) => [todo.id, todo] as const));
 	const recentlyWorkedRootIds = index.groups.recently_worked
 		.map((id) => index.graph.nodes[id]?.parent_ids[0] ?? id)
 		.filter((id) => todoById.has(id))
 		.filter((id, position, ids) => ids.indexOf(id) === position);
-	const detailTodo = selectedTodo && !isTodoClosed(getTodoStatus(selectedTodo))
-		? selectedTodo
-		: openTodos[0] ?? todos[0] ?? null;
+	const detailTodo = selectedTodo ?? openTodos[0] ?? todos[0] ?? null;
 	const selectedRootId = detailTodo
 		? index.graph.nodes[detailTodo.id]?.parent_ids[0] ?? detailTodo.id
 		: null;
 
+	const sidebarStatusForTodo = (todo: TodoRecord, colour: string, meta?: string, child = false) => {
+		const statusColour = isTodoClosed(getTodoStatus(todo)) ? "#5f6874" : colour;
+		return child
+			? todoSidebarChildStatus(getTodoStatus(todo), statusColour, meta)
+			: todoSidebarStatusWithAccent(getTodoStatus(todo), statusColour, meta);
+	};
+
 	const buildListItems = (items: TodoRecord[]) =>
 		items.map((todo) => ({
 			id: todo.id,
-			title: `${formatTodoId(todo.id)} ${todo.title || "(untitled)"}`,
+			title: `${isTodoClosed(getTodoStatus(todo)) ? "✓ " : ""}${formatTodoId(todo.id)} ${todo.title || "(untitled)"}`,
 			subtitle: todoSidebarTagsLine(todo),
-			status: todoSidebarStatusWithAccent(getTodoStatus(todo), normalizeTodoGroupColour(todo.group_colour) ?? TODO_LEAF_COLOUR),
+			status: sidebarStatusForTodo(todo, normalizeTodoGroupColour(todo.group_colour) ?? TODO_LEAF_COLOUR),
 		}));
 
 	const buildTreeItems = () => {
@@ -1998,9 +2073,9 @@ function buildTodoSidebarSurface(
 			const groupColour = childCount ? todoGroupColourForRoot(root) : TODO_LEAF_COLOUR;
 			items.push({
 				id: root.id,
-				title: `${expandedRoot ? "▾" : "▸"} ${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
+				title: `${expandedRoot ? "▾" : "▸"} ${isTodoClosed(getTodoStatus(root)) ? "✓ " : ""}${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
 				subtitle: todoSidebarTagsLine(root),
-				status: todoSidebarStatusWithAccent(getTodoStatus(root), groupColour, todoSidebarChildCountLabel(childCount)),
+				status: sidebarStatusForTodo(root, groupColour, todoSidebarChildCountLabel(childCount)),
 			});
 			if (expandedRoot) {
 				const childIds = visibleChildIds.sort((a, b) =>
@@ -2011,9 +2086,9 @@ function buildTodoSidebarSurface(
 					if (!child) continue;
 					items.push({
 						id: child.id,
-						title: `    ↳ ${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
+						title: `    ↳ ${isTodoClosed(getTodoStatus(child)) ? "✓ " : ""}${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
 						subtitle: todoSidebarTagsLine(child),
-						status: todoSidebarChildStatus(getTodoStatus(child), groupColour),
+						status: sidebarStatusForTodo(child, groupColour, undefined, true),
 					});
 				}
 			}
@@ -2027,15 +2102,16 @@ function buildTodoSidebarSurface(
 			kind: "summary",
 			title: "Overview",
 			items: [
-				{ label: "Open", value: String(openTodos.length) },
-				{ label: "Assigned", value: String(assignedTodos.length) },
-				{ label: "Closed", value: String(todos.length - openTodos.length) },
-				{ label: "Filter", value: search.trim() || "none" },
+				{
+					label: "Counts",
+					value: `Open ${summaryTodos.length - closedTodoCount} • Assigned ${assignedTodos.length} • Closed ${closedTodoCount}`,
+				},
+				{ label: "Filter", value: todoSidebarFilterLabel(filter) },
 			],
 		},
 	];
 
-	if (search.trim()) {
+	if (filter.query.trim()) {
 		sections.push({
 			kind: "list",
 			id: "todo-search-results",
@@ -2056,6 +2132,11 @@ function buildTodoSidebarSurface(
 	return {
 		id: "pi-todos-sidebar",
 		title: "Todos",
+		filter: {
+			value: filter.query,
+			placeholder: "Filter todos… (#tag)",
+			refresh_action_id: TODO_SIDEBAR_REFRESH_ITEM_ID,
+		},
 		sections,
 	};
 }
@@ -2558,7 +2639,9 @@ export default function todosExtension(pi: ExtensionAPI) {
 		const currentSessionId = ctx.sessionManager.getSessionId();
 		let uiState: MpmuxUiState | null = null;
 		const initialTodoId = trimmedArgs && !("error" in validateTodoId(trimmedArgs)) ? normalizeTodoId(trimmedArgs) : null;
-		const sidebarSearch = trimmedArgs && !initialTodoId ? trimmedArgs : "";
+		let sidebarFilter: TodoSidebarFilterState = {
+			query: trimmedArgs && !initialTodoId ? trimmedArgs : "",
+		};
 		let selectedTodoId: string | null = initialTodoId;
 		const expandedRootIds = new Set<string>();
 		const collapsedRootIds = new Set<string>();
@@ -2570,25 +2653,25 @@ export default function todosExtension(pi: ExtensionAPI) {
 
 		const refreshSidebar = async () => {
 			const todos = await listTodoRecords(todosDir);
-			const visibleTodos = sidebarSearch ? filterTodos(todos, sidebarSearch) as TodoRecord[] : todos;
+			const visibleTodos = filterTodosForSidebar(todos, sidebarFilter);
 			const selectedTodo = selectedTodoFromId(visibleTodos, selectedTodoId);
 			selectedTodoId = selectedTodo?.id ?? null;
 			await showMpmuxTodoSidebar(
 				state,
-				buildTodoSidebarSurface(visibleTodos, selectedTodo, sidebarSearch, currentSessionId, {
+				buildTodoSidebarSurface(visibleTodos, selectedTodo, sidebarFilter.query, currentSessionId, {
 					expanded: useExpandedTodoSidebarLayout(uiState),
 					expandedRootIds,
 					collapsedRootIds,
+					allTodos: todos,
+					filter: sidebarFilter,
 				}),
 			);
 		};
 
 		const toggleTodoTreeRoot = async (todoId: string, options: { collapseOnly?: boolean; expandOnly?: boolean } = {}): Promise<boolean> => {
 			const todos = await listTodoRecords(todosDir);
-			const visibleTodos = sidebarSearch ? filterTodos(todos, sidebarSearch) as TodoRecord[] : todos;
-			const index = buildTodoIndex(
-				visibleTodos.filter((todo) => !isTodoClosed(getTodoStatus(todo))),
-			);
+			const visibleTodos = filterTodosForSidebar(todos, sidebarFilter);
+			const index = buildTodoIndex(visibleTodos);
 			const normalized = normalizeTodoId(todoId);
 			const rootId = todoIndexRootId(index, normalized);
 			if (!rootId) return false;
@@ -2652,7 +2735,23 @@ export default function todosExtension(pi: ExtensionAPI) {
 			}
 		};
 
-		const applyDialogAction = async (actionId: string) => {
+		const forceRefreshSidebar = async () => {
+			sidebarDirty = false;
+			await refreshSidebar();
+			ctx.ui.notify("Todo sidebar reloaded", "info");
+		};
+
+		const updateSidebarFilter = async (query: string) => {
+			if (sidebarFilter.query === query) return;
+			sidebarFilter = { query };
+			selectedTodoId = null;
+			expandedRootIds.clear();
+			collapsedRootIds.clear();
+			await refreshSidebar();
+		};
+
+		const applyDialogAction = async (action: MpmuxCustomDialogActionEvent["result"]) => {
+			const actionId = action.action_id;
 			if (!selectedTodoId) return;
 			const todo = (await listTodoRecords(todosDir)).find((item) => item.id === selectedTodoId);
 			if (!todo) {
@@ -2761,7 +2860,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 							keepRunning = false;
 							break;
 						}
-						if (event.custom_sidebar.selected_item_id) {
+						if (event.custom_sidebar.selected_item_id && !isTodoSidebarActionItemId(event.custom_sidebar.selected_item_id)) {
 							// The host already moves the visible highlight locally for ArrowUp/ArrowDown.
 							// Do not echo every selection change back through show-custom-sidebar: doing so
 							// rebuilds the whole sidebar, resets scroll targets, and makes cursor navigation
@@ -2775,7 +2874,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 							interaction.nonce > lastSidebarInteractionNonce
 						) {
 							lastSidebarInteractionNonce = interaction.nonce;
+							if (interaction.kind === "filter-changed") {
+								await updateSidebarFilter(interaction.value ?? "");
+								continue;
+							}
 							if (interaction.kind === "item-invoked" && interaction.item_id) {
+								if (interaction.item_id === TODO_SIDEBAR_REFRESH_ITEM_ID) {
+									await forceRefreshSidebar();
+									continue;
+								}
 								const source = interaction.source ?? "keyboard";
 								if (source === "pointer") {
 									await toggleTodoTreeRoot(interaction.item_id);
@@ -2802,7 +2909,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 						const action = event.custom_dialog.last_action;
 						if (action.nonce > lastDialogActionNonce) {
 							lastDialogActionNonce = action.nonce;
-							await applyDialogAction(action.result.action_id);
+							await applyDialogAction(action.result);
 						}
 					}
 				}
