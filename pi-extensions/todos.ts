@@ -1357,12 +1357,17 @@ function relationshipKindsForLine(line: string): TodoRelationshipKind[] {
 function relationshipEdgesForTodo(todo: TodoRecord, knownTodoIds: Set<string>): TodoRelationshipEdge[] {
 	const edges: TodoRelationshipEdge[] = [];
 	const lines = todo.body.split(/\r?\n/);
+	let sectionKinds: TodoRelationshipKind[] = [];
 	for (const rawLine of lines) {
+		const lineKinds = relationshipKindsForLine(rawLine);
+		if (/^#{1,6}\s+/.test(rawLine)) {
+			sectionKinds = lineKinds;
+		}
 		const referencedIds = extractTodoIds(rawLine).filter(
 			(id) => id !== todo.id && knownTodoIds.has(id),
 		);
 		if (!referencedIds.length) continue;
-		const kinds = relationshipKindsForLine(rawLine);
+		const kinds = lineKinds.length ? lineKinds : sectionKinds;
 		const context = rawLine.trim();
 		for (const referencedId of referencedIds) {
 			if (kinds.length === 0) {
@@ -2515,18 +2520,21 @@ export default function todosExtension(pi: ExtensionAPI) {
 
 	function submitTodoActionPrompt(prompt: string, ctx: ExtensionContext): void {
 		try {
-			if (ctx.isIdle()) {
-				pi.sendUserMessage(prompt);
-			} else {
-				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
-				ctx.ui.notify("Todo action queued as follow-up", "info");
+			pi.sendUserMessage(prompt);
+			ctx.ui.notify("Todo action sent", "info");
+			return;
+		} catch (immediateError) {
+			try {
+				pi.sendUserMessage(prompt, { deliverAs: "steer" });
+				ctx.ui.notify("Todo action queued for the active turn", "info");
+				return;
+			} catch (queuedError) {
+				ctx.ui.setEditorText(prompt);
+				ctx.ui.notify(
+					`Todo action could not auto-submit; inserted it into the editor instead: ${queuedError instanceof Error ? queuedError.message : immediateError instanceof Error ? immediateError.message : String(queuedError)}`,
+					"warning",
+				);
 			}
-		} catch (error) {
-			ctx.ui.setEditorText(prompt);
-			ctx.ui.notify(
-				`Todo action could not auto-submit; inserted it into the editor instead: ${error instanceof Error ? error.message : String(error)}`,
-				"warning",
-			);
 		}
 	}
 
@@ -2556,7 +2564,6 @@ export default function todosExtension(pi: ExtensionAPI) {
 		const collapsedRootIds = new Set<string>();
 		let lastSidebarInteractionNonce = 0;
 		let lastDialogActionNonce = 0;
-		let nextPrompt: string | null = null;
 		let keepRunning = !signal?.aborted;
 		let sidebarDirty = false;
 		let todosWatcher: FSWatcher | null = null;
@@ -2656,13 +2663,11 @@ export default function todosExtension(pi: ExtensionAPI) {
 
 			switch (actionId) {
 				case "work": {
-					nextPrompt = workPromptForTodo(todo);
-					keepRunning = false;
+					submitTodoActionPrompt(workPromptForTodo(todo), ctx);
 					return;
 				}
 				case "refine": {
-					nextPrompt = buildRefinePrompt(todo.id, todo.title || "(untitled)");
-					keepRunning = false;
+					submitTodoActionPrompt(buildRefinePrompt(todo.id, todo.title || "(untitled)"), ctx);
 					return;
 				}
 				case "claim-toggle": {
@@ -2815,10 +2820,6 @@ export default function todosExtension(pi: ExtensionAPI) {
 				await clearMpmuxTodoSidebar(state).catch(() => undefined);
 				await cleanupMpmuxHostSidebarState(state).catch(() => undefined);
 			}
-		}
-
-		if (nextPrompt) {
-			submitTodoActionPrompt(nextPrompt, ctx);
 		}
 	}
 
