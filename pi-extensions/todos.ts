@@ -1841,12 +1841,21 @@ function todoGroupColourForRoot(todo: TodoRecord): string {
 		?? TODO_GROUP_COLOUR_PALETTE[hashTodoIdToPaletteIndex(todo.id, TODO_GROUP_COLOUR_PALETTE.length)];
 }
 
-function todoSidebarStatusWithAccent(status: string, colour: string): string {
-	return `${status}|accent:${colour}`;
+function todoSidebarStatusWithAccent(status: string, colour: string, meta?: string): string {
+	return `${status}|accent:${colour}${meta ? `|meta:${meta}` : ""}`;
 }
 
-function todoSidebarChildStatus(status: string, colour: string): string {
-	return `${todoSidebarStatusWithAccent(status, colour)}|level:1`;
+function todoSidebarChildStatus(status: string, colour: string, meta?: string): string {
+	return `${todoSidebarStatusWithAccent(status, colour, meta)}|level:1`;
+}
+
+function todoSidebarTagsLine(todo: TodoFrontMatter): string {
+	return todo.tags.length ? todo.tags.map((tag) => `#${tag}`).join("  ") : "no tags";
+}
+
+function todoSidebarChildCountLabel(childCount: number): string | undefined {
+	if (childCount <= 0) return undefined;
+	return `${childCount} child todo${childCount === 1 ? "" : "s"}`;
 }
 
 function todoIndexRootId(index: TodoIndex, todoId: string): string | null {
@@ -1883,9 +1892,48 @@ function buildTodoSidebarDetailLines(
 	if (assignment) lines.push(assignment);
 	lines.push("");
 	const bodyText = todo.body?.trim() ? todo.body.trim() : "No details yet.";
-	for (const line of bodyText.split(/\r?\n/).slice(0, maxBodyLines)) {
+	for (const line of formatTodoMarkdownBodyLines(bodyText).slice(0, maxBodyLines)) {
 		lines.push(line);
 	}
+	return lines;
+}
+
+function todoClipboardId(todo: TodoFrontMatter): string {
+	return formatTodoId(todo.id);
+}
+
+function formatTodoMarkdownBodyLines(markdown: string): string[] {
+	const lines = markdown.split(/\r?\n/);
+	let inCodeBlock = false;
+	return lines.map((rawLine) => {
+		const line = rawLine.replace(/\s+$/, "");
+		const trimmed = line.trim();
+		if (trimmed.startsWith("```")) {
+			inCodeBlock = !inCodeBlock;
+			return inCodeBlock ? "┌─ code" : "└─";
+		}
+		if (inCodeBlock) return `│ ${line}`;
+		const heading = /^(#{1,6})\s+(.*)$/.exec(trimmed);
+		if (heading) {
+			const level = heading[1].length;
+			const marker = level <= 2 ? "▸" : "•";
+			return `${marker} ${heading[2]}`;
+		}
+		const task = /^[-*]\s+\[([ xX])]\s+(.*)$/.exec(trimmed);
+		if (task) return `${task[1].trim().toLowerCase() === "x" ? "☑" : "☐"} ${task[2]}`;
+		const bullet = /^[-*]\s+(.*)$/.exec(trimmed);
+		if (bullet) return `• ${bullet[1]}`;
+		const numbered = /^(\d+)\.\s+(.*)$/.exec(trimmed);
+		if (numbered) return `${numbered[1]}. ${numbered[2]}`;
+		return line;
+	});
+}
+
+function buildTodoSidebarFullDetailLines(todo: TodoRecord, currentSessionId?: string): string[] {
+	const lines = buildTodoSidebarDetailLines(todo, currentSessionId, 0).slice(0, -1);
+	const bodyText = todo.body?.trim() ? todo.body.trim() : "No details yet.";
+	lines.push("");
+	lines.push(...formatTodoMarkdownBodyLines(bodyText));
 	return lines;
 }
 
@@ -1918,7 +1966,7 @@ function buildTodoSidebarSurface(
 		items.map((todo) => ({
 			id: todo.id,
 			title: `${formatTodoId(todo.id)} ${todo.title || "(untitled)"}`,
-			subtitle: todoSnippet(todo),
+			subtitle: todoSidebarTagsLine(todo),
 			status: todoSidebarStatusWithAccent(getTodoStatus(todo), normalizeTodoGroupColour(todo.group_colour) ?? TODO_LEAF_COLOUR),
 		}));
 
@@ -1946,8 +1994,8 @@ function buildTodoSidebarSurface(
 			items.push({
 				id: root.id,
 				title: `${expandedRoot ? "▾" : "▸"} ${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
-				subtitle: childCount ? `${childCount} child todo${childCount === 1 ? "" : "s"}` : todoSnippet(root),
-				status: todoSidebarStatusWithAccent(getTodoStatus(root), groupColour),
+				subtitle: todoSidebarTagsLine(root),
+				status: todoSidebarStatusWithAccent(getTodoStatus(root), groupColour, todoSidebarChildCountLabel(childCount)),
 			});
 			if (expandedRoot) {
 				const childIds = visibleChildIds.sort((a, b) =>
@@ -1959,7 +2007,7 @@ function buildTodoSidebarSurface(
 					items.push({
 						id: child.id,
 						title: `    ↳ ${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
-						subtitle: todoSnippet(child),
+						subtitle: todoSidebarTagsLine(child),
 						status: todoSidebarChildStatus(getTodoStatus(child), groupColour),
 					});
 				}
@@ -1999,24 +2047,6 @@ function buildTodoSidebarSurface(
 			selected_id: detailTodo?.id,
 		});
 	}
-
-	sections.push({
-		kind: "detail",
-		id: "todo-selected-detail",
-		title: detailTodo ? (expanded ? "Selected todo details" : "Selected todo") : "No todo selected",
-		lines: detailTodo
-			? buildTodoSidebarDetailLines(detailTodo, currentSessionId, expanded ? 12 : 5)
-			: ["No open todo selected."],
-	});
-
-	sections.push({
-		kind: "actions",
-		buttons: [
-			{ id: "enter", label: "Enter: actions" },
-			{ id: "work", label: "Ctrl+Shift+W: work" },
-			{ id: "refine", label: "Ctrl+Shift+R: refine" },
-		],
-	});
 
 	return {
 		id: "pi-todos-sidebar",
@@ -2257,7 +2287,7 @@ function buildTodoSidebarDialogSurface(todo: TodoRecord, currentSessionId?: stri
 				kind: "detail",
 				id: "todo-details",
 				title: "Todo details",
-				lines: buildTodoSidebarDetailLines(todo, currentSessionId, 12),
+				lines: buildTodoSidebarFullDetailLines(todo, currentSessionId),
 			},
 		],
 		footer: {
@@ -2448,6 +2478,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 
 	const todosDirLabel = getTodosDirLabel(process.cwd());
 	const hostSidebarClients = new Map<string, MpmuxHostSidebarState>();
+	let activeTodoSidebarRun: { controller: AbortController; promise: Promise<void> } | null = null;
+	const todoSidebarAbortReasons = new WeakMap<AbortSignal, "replace" | "clear" | "shutdown">();
+
+	function abortActiveTodoSidebar(reason: "replace" | "clear" | "shutdown"): Promise<void> | null {
+		if (!activeTodoSidebarRun) return null;
+		todoSidebarAbortReasons.set(activeTodoSidebarRun.controller.signal, reason);
+		activeTodoSidebarRun.controller.abort();
+		return activeTodoSidebarRun.promise;
+	}
 
 	function getHostSidebarState(socketPath = defaultMpmuxSocketPath()): MpmuxHostSidebarState {
 		let state = hostSidebarClients.get(socketPath);
@@ -2463,6 +2502,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_shutdown", async () => {
+		abortActiveTodoSidebar("shutdown");
 		for (const state of hostSidebarClients.values()) {
 			await cleanupMpmuxHostSidebarState(state);
 		}
@@ -2473,6 +2513,23 @@ export default function todosExtension(pi: ExtensionAPI) {
 		return `work on todo ${formatTodoId(todo.id)} "${todo.title || "(untitled)"}"`;
 	}
 
+	function submitTodoActionPrompt(prompt: string, ctx: ExtensionContext): void {
+		try {
+			if (ctx.isIdle()) {
+				pi.sendUserMessage(prompt);
+			} else {
+				pi.sendUserMessage(prompt, { deliverAs: "followUp" });
+				ctx.ui.notify("Todo action queued as follow-up", "info");
+			}
+		} catch (error) {
+			ctx.ui.setEditorText(prompt);
+			ctx.ui.notify(
+				`Todo action could not auto-submit; inserted it into the editor instead: ${error instanceof Error ? error.message : String(error)}`,
+				"warning",
+			);
+		}
+	}
+
 	function selectedTodoFromId(todos: TodoRecord[], selectedTodoId: string | null): TodoRecord | null {
 		if (selectedTodoId) {
 			const exact = todos.find((todo) => todo.id === normalizeTodoId(selectedTodoId));
@@ -2481,7 +2538,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		return todos.find((todo) => !isTodoClosed(getTodoStatus(todo))) ?? todos[0] ?? null;
 	}
 
-	async function runTodoSidebarHostUi(args: string, ctx: ExtensionCommandContext): Promise<void> {
+	async function runTodoSidebarHostUi(args: string, ctx: ExtensionCommandContext, signal?: AbortSignal): Promise<void> {
 		const trimmedArgs = (args ?? "").trim();
 		if (!ctx.hasUI) {
 			console.log("/todos-sidebar requires the Pi UI and an mpmux host session.");
@@ -2489,11 +2546,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		}
 
 		const todosDir = getTodosDir(ctx.cwd);
-		const state: MpmuxHostSidebarState = {
-			socketPath: defaultMpmuxSocketPath(),
-			clientId: createMpmuxHostClientId(),
-			attached: false,
-		};
+		const state = getHostSidebarState();
 		const currentSessionId = ctx.sessionManager.getSessionId();
 		let uiState: MpmuxUiState | null = null;
 		const initialTodoId = trimmedArgs && !("error" in validateTodoId(trimmedArgs)) ? normalizeTodoId(trimmedArgs) : null;
@@ -2504,7 +2557,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		let lastSidebarInteractionNonce = 0;
 		let lastDialogActionNonce = 0;
 		let nextPrompt: string | null = null;
-		let keepRunning = true;
+		let keepRunning = !signal?.aborted;
 		let sidebarDirty = false;
 		let todosWatcher: FSWatcher | null = null;
 
@@ -2571,6 +2624,24 @@ export default function todosExtension(pi: ExtensionAPI) {
 					return;
 				}
 				throw error;
+			}
+		};
+
+		const copySelectedTodoReference = async (todoId: string) => {
+			const todos = await listTodoRecords(todosDir);
+			const todo = todos.find((item) => item.id === normalizeTodoId(todoId));
+			if (!todo) {
+				ctx.ui.notify(`Todo ${displayTodoId(todoId)} not found`, "error");
+				await refreshSidebar();
+				return;
+			}
+			selectedTodoId = todo.id;
+			const label = todoClipboardId(todo);
+			try {
+				await copyToClipboard(label);
+				ctx.ui.notify(`Copied ${label}`, "info");
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 			}
 		};
 
@@ -2644,7 +2715,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 			uiState = await showMpmuxTodoUiState(state);
 			await refreshSidebar();
 
-			while (keepRunning) {
+			while (keepRunning && !signal?.aborted) {
 				let response: MpmuxHostPollEventsResponse;
 				try {
 					response = await pollMpmuxTodoHostEvents(state);
@@ -2713,6 +2784,10 @@ export default function todosExtension(pi: ExtensionAPI) {
 									await toggleTodoTreeRoot(interaction.item_id, { expandOnly: true });
 									continue;
 								}
+								if (source === "copy") {
+									await copySelectedTodoReference(interaction.item_id);
+									continue;
+								}
 								await openSelectedTodoDialog(interaction.item_id);
 							}
 						}
@@ -2734,13 +2809,16 @@ export default function todosExtension(pi: ExtensionAPI) {
 			);
 		} finally {
 			todosWatcher?.close();
-			await clearMpmuxTodoDialog(state).catch(() => undefined);
-			await clearMpmuxTodoSidebar(state).catch(() => undefined);
-			await cleanupMpmuxHostSidebarState(state).catch(() => undefined);
+			const abortReason = signal ? todoSidebarAbortReasons.get(signal) : undefined;
+			if (abortReason !== "replace") {
+				await clearMpmuxTodoDialog(state).catch(() => undefined);
+				await clearMpmuxTodoSidebar(state).catch(() => undefined);
+				await cleanupMpmuxHostSidebarState(state).catch(() => undefined);
+			}
 		}
 
 		if (nextPrompt) {
-			ctx.ui.setEditorText(nextPrompt);
+			submitTodoActionPrompt(nextPrompt, ctx);
 		}
 	}
 
@@ -3055,7 +3133,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		});
 
 		if (nextPrompt) {
-			ctx.ui.setEditorText(nextPrompt);
+			submitTodoActionPrompt(nextPrompt, ctx);
 			rootTui?.requestRender();
 		}
 
@@ -3492,10 +3570,23 @@ export default function todosExtension(pi: ExtensionAPI) {
 		},
 	});
 
+	const openTodoSidebarCommand = (args: string, ctx: ExtensionCommandContext) => {
+		abortActiveTodoSidebar("replace");
+		const controller = new AbortController();
+		const promise = runTodoSidebarHostUi(args, ctx, controller.signal).finally(() => {
+			if (activeTodoSidebarRun?.controller === controller) {
+				activeTodoSidebarRun = null;
+			}
+		});
+		activeTodoSidebarRun = { controller, promise };
+		ctx.ui.notify("Opened the mpmux todo sidebar.", "info");
+	};
+
 	pi.registerCommand("todos-sidebar", {
 		description: "Open the standalone mpmux-hosted todo sidebar UI",
 		handler: async (args, ctx) => {
 			if ((args ?? "").trim() === "--clear") {
+				abortActiveTodoSidebar("clear");
 				const state = getHostSidebarState();
 				try {
 					await clearMpmuxTodoDialog(state).catch(() => undefined);
@@ -3510,7 +3601,14 @@ export default function todosExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			await runTodoSidebarHostUi(args, ctx);
+			openTodoSidebarCommand(args, ctx);
+		},
+	});
+
+	pi.registerShortcut("ctrl+alt+shift+t", {
+		description: "Open the mpmux todo sidebar",
+		handler: async (ctx) => {
+			openTodoSidebarCommand("", ctx as ExtensionCommandContext);
 		},
 	});
 
