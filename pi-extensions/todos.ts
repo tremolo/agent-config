@@ -407,8 +407,39 @@ function filterTodos(todos: TodoFrontMatter[], query: string): TodoFrontMatter[]
 		.map((match) => match.todo);
 }
 
-function todoSidebarFilterLabel(filter: TodoSidebarFilterState): string {
-	return filter.query.trim() || "none";
+function todoHasOpenDescendant(
+	todo: TodoRecord,
+	index: TodoIndex,
+	todoById: ReadonlyMap<string, TodoRecord>,
+	visited = new Set<string>(),
+): boolean {
+	if (visited.has(todo.id)) return false;
+	visited.add(todo.id);
+	const childIds = index.graph.nodes[todo.id]?.child_ids ?? [];
+	for (const childId of childIds) {
+		const child = todoById.get(childId);
+		if (!child) continue;
+		if (!isTodoClosed(getTodoStatus(child)) || todoHasOpenDescendant(child, index, todoById, visited)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function todoStatusWithOpenDescendants(todo: TodoRecord, index: TodoIndex, todoById: ReadonlyMap<string, TodoRecord>): string {
+	const status = getTodoStatus(todo);
+	if (isTodoClosed(status) && todoHasOpenDescendant(todo, index, todoById)) {
+		return "open";
+	}
+	return status;
+}
+
+function todoSidebarCountsLabel(todos: TodoRecord[]): string {
+	const index = buildTodoIndex(todos);
+	const todoById = new Map(todos.map((todo) => [todo.id, todo] as const));
+	const closed = todos.filter((todo) => isTodoClosed(todoStatusWithOpenDescendants(todo, index, todoById))).length;
+	const assigned = todos.filter((todo) => !isTodoClosed(todoStatusWithOpenDescendants(todo, index, todoById)) && Boolean(todo.assigned_to_session)).length;
+	return `Open ${todos.length - closed} • Assigned ${assigned} • Closed ${closed}`;
 }
 
 function splitTodoSidebarFilterQuery(query: string): { text: string; tags: string[] } {
@@ -445,9 +476,10 @@ function todoMatchesSidebarFilter(todo: TodoRecord, filter: TodoSidebarFilterSta
 }
 
 function filterTodosForSidebar(todos: TodoRecord[], filter: TodoSidebarFilterState): TodoRecord[] {
-	const matchingOpenTodos = todos.filter((todo) => !isTodoClosed(getTodoStatus(todo)) && todoMatchesSidebarFilter(todo, filter));
-	const matchingOpenIds = new Set(matchingOpenTodos.map((todo) => todo.id));
 	const index = buildTodoIndex(todos);
+	const todoById = new Map(todos.map((todo) => [todo.id, todo] as const));
+	const matchingOpenTodos = todos.filter((todo) => !isTodoClosed(todoStatusWithOpenDescendants(todo, index, todoById)) && todoMatchesSidebarFilter(todo, filter));
+	const matchingOpenIds = new Set(matchingOpenTodos.map((todo) => todo.id));
 	const visibleIds = new Set(matchingOpenIds);
 	for (const todo of matchingOpenTodos) {
 		for (const parentId of index.graph.nodes[todo.id]?.parent_ids ?? []) {
@@ -2021,11 +2053,11 @@ function buildTodoSidebarSurface(
 	const collapsedRootIds = options?.collapsedRootIds;
 	const filter = options?.filter ?? { query: search };
 	const summaryTodos = options?.allTodos ?? todos;
-	const openTodos = todos.filter((todo) => !isTodoClosed(getTodoStatus(todo)));
-	const assignedTodos = summaryTodos.filter((todo) => !isTodoClosed(getTodoStatus(todo)) && Boolean(todo.assigned_to_session));
-	const closedTodoCount = summaryTodos.filter((todo) => isTodoClosed(getTodoStatus(todo))).length;
+	const countsLabel = todoSidebarCountsLabel(summaryTodos);
 	const index = buildTodoIndex(todos);
 	const todoById = new Map(todos.map((todo) => [todo.id, todo] as const));
+	const sidebarStatus = (todo: TodoRecord) => todoStatusWithOpenDescendants(todo, index, todoById);
+	const openTodos = todos.filter((todo) => !isTodoClosed(sidebarStatus(todo)));
 	const recentlyWorkedRootIds = index.groups.recently_worked
 		.map((id) => index.graph.nodes[id]?.parent_ids[0] ?? id)
 		.filter((id) => todoById.has(id))
@@ -2036,10 +2068,11 @@ function buildTodoSidebarSurface(
 		: null;
 
 	const sidebarStatusForTodo = (todo: TodoRecord, colour: string, meta?: string, child = false) => {
-		const statusColour = isTodoClosed(getTodoStatus(todo)) ? "#5f6874" : colour;
+		const status = sidebarStatus(todo);
+		const statusColour = isTodoClosed(status) ? "#5f6874" : colour;
 		return child
-			? todoSidebarChildStatus(getTodoStatus(todo), statusColour, meta)
-			: todoSidebarStatusWithAccent(getTodoStatus(todo), statusColour, meta);
+			? todoSidebarChildStatus(status, statusColour, meta)
+			: todoSidebarStatusWithAccent(status, statusColour, meta);
 	};
 
 	const buildListItems = (items: TodoRecord[]) =>
@@ -2073,7 +2106,7 @@ function buildTodoSidebarSurface(
 			const groupColour = childCount ? todoGroupColourForRoot(root) : TODO_LEAF_COLOUR;
 			items.push({
 				id: root.id,
-				title: `${expandedRoot ? "▾" : "▸"} ${isTodoClosed(getTodoStatus(root)) ? "✓ " : ""}${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
+				title: `${isTodoClosed(getTodoStatus(root)) ? "✓ " : ""}${formatTodoId(root.id)} ${root.title || "(untitled)"}`,
 				subtitle: todoSidebarTagsLine(root),
 				status: sidebarStatusForTodo(root, groupColour, todoSidebarChildCountLabel(childCount)),
 			});
@@ -2086,7 +2119,7 @@ function buildTodoSidebarSurface(
 					if (!child) continue;
 					items.push({
 						id: child.id,
-						title: `    ↳ ${isTodoClosed(getTodoStatus(child)) ? "✓ " : ""}${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
+						title: `  ${isTodoClosed(getTodoStatus(child)) ? "✓ " : ""}${formatTodoId(child.id)} ${child.title || "(untitled)"}`,
 						subtitle: todoSidebarTagsLine(child),
 						status: sidebarStatusForTodo(child, groupColour, undefined, true),
 					});
@@ -2097,25 +2130,13 @@ function buildTodoSidebarSurface(
 		return items.slice(0, maxVisible);
 	};
 
-	const sections: Array<Record<string, unknown>> = [
-		{
-			kind: "summary",
-			title: "Overview",
-			items: [
-				{
-					label: "Counts",
-					value: `Open ${summaryTodos.length - closedTodoCount} • Assigned ${assignedTodos.length} • Closed ${closedTodoCount}`,
-				},
-				{ label: "Filter", value: todoSidebarFilterLabel(filter) },
-			],
-		},
-	];
+	const sections: Array<Record<string, unknown>> = [];
 
 	if (filter.query.trim()) {
 		sections.push({
 			kind: "list",
 			id: "todo-search-results",
-			label: "Filtered todos",
+			label: `Filtered todos • ${countsLabel}`,
 			items: buildListItems(todos),
 			selected_id: detailTodo?.id,
 		});
@@ -2123,7 +2144,7 @@ function buildTodoSidebarSurface(
 		sections.push({
 			kind: "list",
 			id: "todo-tree-list",
-			label: expanded ? "Todo tree" : "Recent todo tree",
+			label: `${expanded ? "Todo tree" : "Recent todos"} • ${countsLabel}`,
 			items: buildTreeItems(),
 			selected_id: detailTodo?.id,
 		});
@@ -2738,7 +2759,7 @@ export default function todosExtension(pi: ExtensionAPI) {
 		const forceRefreshSidebar = async () => {
 			sidebarDirty = false;
 			await refreshSidebar();
-			ctx.ui.notify("Todo sidebar reloaded", "info");
+			ctx.ui.notify("Todo sidebar refreshed", "info");
 		};
 
 		const updateSidebarFilter = async (query: string) => {
@@ -2753,7 +2774,8 @@ export default function todosExtension(pi: ExtensionAPI) {
 		const applyDialogAction = async (action: MpmuxCustomDialogActionEvent["result"]) => {
 			const actionId = action.action_id;
 			if (!selectedTodoId) return;
-			const todo = (await listTodoRecords(todosDir)).find((item) => item.id === selectedTodoId);
+			const currentTodos = await listTodoRecords(todosDir);
+			const todo = currentTodos.find((item) => item.id === selectedTodoId);
 			if (!todo) {
 				ctx.ui.notify(`Todo ${displayTodoId(selectedTodoId)} not found`, "error");
 				await refreshSidebar();
@@ -2790,6 +2812,15 @@ export default function todosExtension(pi: ExtensionAPI) {
 				}
 				case "status-toggle": {
 					const nextStatus = isTodoClosed(getTodoStatus(todo)) ? "open" : "closed";
+					if (nextStatus === "closed") {
+						const index = buildTodoIndex(currentTodos);
+						const todoById = new Map(currentTodos.map((item) => [item.id, item] as const));
+						if (todoHasOpenDescendant(todo, index, todoById)) {
+							ctx.ui.notify(`Cannot close ${formatTodoId(todo.id)} while child todos are open`, "error");
+							await refreshSidebar();
+							return;
+						}
+					}
 					const result = await updateTodoStatus(todosDir, todo.id, nextStatus, ctx);
 					if ("error" in result) {
 						ctx.ui.notify(result.error, "error");
@@ -2809,10 +2840,11 @@ export default function todosExtension(pi: ExtensionAPI) {
 
 		try {
 			await ensureTodosDir(todosDir);
-			todosWatcher = watch(todosDir, (eventType, filename) => {
-				if (eventType === "rename" || (typeof filename === "string" && filename.endsWith(".md"))) {
-					sidebarDirty = true;
-				}
+			todosWatcher = watch(todosDir, () => {
+				// fs.watch can report platform-specific event names and can omit filenames.
+				// Treat any todos-dir change as a sidebar invalidation so external todo
+				// updates are visible without requiring a manual command restart.
+				sidebarDirty = true;
 			});
 			await ensureMpmuxHostAttached(state);
 			await subscribeMpmuxTodoHostEvents(state);
@@ -2820,6 +2852,11 @@ export default function todosExtension(pi: ExtensionAPI) {
 			await refreshSidebar();
 
 			while (keepRunning && !signal?.aborted) {
+				if (sidebarDirty) {
+					sidebarDirty = false;
+					await refreshSidebar();
+				}
+
 				let response: MpmuxHostPollEventsResponse;
 				try {
 					response = await pollMpmuxTodoHostEvents(state);
