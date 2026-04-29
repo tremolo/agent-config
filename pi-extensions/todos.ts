@@ -2333,6 +2333,15 @@ async function clearMpmuxTodoDialog(state: MpmuxHostSidebarState): Promise<void>
 	});
 }
 
+async function displayMpmuxTodoMessage(state: MpmuxHostSidebarState, message: string): Promise<void> {
+	await withMpmuxHostControl(state, async () => {
+		await sendMpmuxHostRequest(state.socketPath, "display-message", {
+			client_id: state.clientId,
+			message,
+		});
+	});
+}
+
 async function subscribeMpmuxTodoHostEvents(state: MpmuxHostSidebarState): Promise<void> {
 	await ensureMpmuxHostAttached(state);
 	await sendMpmuxHostRequest(state.socketPath, "subscribe", {
@@ -2825,12 +2834,11 @@ export default function todosExtension(pi: ExtensionAPI) {
 					if ("error" in result) {
 						ctx.ui.notify(result.error, "error");
 					} else {
-						ctx.ui.notify(
-							nextStatus === "closed"
-								? `Closed ${formatTodoId(todo.id)}`
-								: `Reopened ${formatTodoId(todo.id)}`,
-							"info",
-						);
+						const message = nextStatus === "closed"
+							? `Closed ${formatTodoId(todo.id)}`
+							: `Reopened ${formatTodoId(todo.id)}`;
+						await displayMpmuxTodoMessage(state, message).catch(() => undefined);
+						ctx.ui.notify(message, "info");
 					}
 					await refreshSidebar();
 					return;
