@@ -2945,6 +2945,49 @@ export default function todosExtension(pi: ExtensionAPI) {
 									await copySelectedTodoReference(interaction.item_id);
 									continue;
 								}
+								if (source.startsWith("pie-")) {
+									switch (source) {
+										case "pie-copy-id":
+											await copySelectedTodoReference(interaction.item_id);
+											break;
+										case "pie-work": {
+											const todo = (await listTodoRecords(todosDir)).find((candidate) => candidate.id === normalizeTodoId(interaction.item_id));
+											if (todo) submitTodoActionPrompt(workPromptForTodo(todo), ctx);
+											break;
+										}
+										case "pie-refine": {
+											const todo = (await listTodoRecords(todosDir)).find((candidate) => candidate.id === normalizeTodoId(interaction.item_id));
+											if (todo) submitTodoActionPrompt(buildRefinePrompt(todo.id, todo.title || "(untitled)"), ctx);
+											break;
+										}
+										case "pie-claim":
+											selectedTodoId = normalizeTodoId(interaction.item_id);
+											await applyDialogAction({
+												dialog_id: "todo-sidebar-pie",
+												action_id: "claim-toggle",
+												submitted: true,
+												values: [],
+											});
+											break;
+										case "pie-close":
+											selectedTodoId = normalizeTodoId(interaction.item_id);
+											await applyDialogAction({
+												dialog_id: "todo-sidebar-pie",
+												action_id: "status-toggle",
+												submitted: true,
+												values: [],
+											});
+											break;
+										case "pie-view":
+										case "pie-details":
+										case "pie-more":
+											await openSelectedTodoDialog(interaction.item_id);
+											break;
+										default:
+											ctx.ui.notify(`Unhandled todo pie action: ${source}`, "warning");
+									}
+									continue;
+								}
 								await openSelectedTodoDialog(interaction.item_id);
 							}
 						}
