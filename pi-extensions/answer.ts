@@ -32,7 +32,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { type Api, type Model, type UserMessage, complete } from "@earendil-works/pi-ai";
+import { type Api, type Model, type UserMessage } from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -558,7 +558,9 @@ export default function (pi: ExtensionAPI) {
 
         // reasoningEffort only reaches reasoning-capable OpenAI/codex adapters;
         // other providers ignore the extra key.
-        const response = await complete(
+        // pi-ai >= 1.x has no standalone complete(); the registry wraps the provider
+        // call and does request-time auth (see examples/extensions/qna.ts).
+        const response = await ctx.modelRegistry.complete(
           extractionModel,
           { systemPrompt: SYSTEM_PROMPT, messages: [userMessage] },
           {
@@ -573,6 +575,12 @@ export default function (pi: ExtensionAPI) {
 
         if (response.stopReason === "aborted") {
           return { kind: "aborted" };
+        }
+
+        // A provider that is configured wrong answers with stopReason "error" and no
+        // content; without this it would surface as a confusing "could not parse".
+        if (response.stopReason === "error") {
+          return { kind: "error", message: response.errorMessage || "the extraction model returned an error" };
         }
 
         const responseText = response.content
